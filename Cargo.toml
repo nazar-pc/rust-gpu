@@ -101,4 +101,6 @@ codegen-units = 1
 # - WIP: var-io
 # - WIP: spv-const-op
 # - WIP: spv-const-fn-ptr
-spirt = { git = "https://github.com/LykenSol/spirt", rev = "c11d6a20" }
+# - WIP: scalar
+# - WIP: vector
+spirt = { git = "https://github.com/LykenSol/spirt", branch = "vector" }

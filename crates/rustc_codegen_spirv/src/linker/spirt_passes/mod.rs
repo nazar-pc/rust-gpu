@@ -11,6 +11,7 @@ use rustc_data_structures::fx::FxIndexSet;
 use rustc_index::bit_set::DenseBitSet as BitSet;
 use smallvec::SmallVec;
 use spirt::func_at::FuncAt;
+use spirt::qptr::QPtrOp;
 use spirt::visit::{InnerVisit, Visitor};
 use spirt::{
     AttrSet, Const, Context, DataInstKind, DeclDef, EntityOrientedDenseMap, Func, FuncDefBody,
@@ -69,7 +70,6 @@ macro_rules! def_spv_spec_with_extra_well_known {
                         };
 
                         let lookup_fns = PerWellKnownGroup {
-                            opcode: |name| spv_spec.instructions.lookup(name).unwrap(),
                             operand_kind: |name| spv_spec.operand_kinds.lookup(name).unwrap(),
                             decoration: |name| decorations.lookup(name).unwrap().into(),
                         };
@@ -91,15 +91,6 @@ macro_rules! def_spv_spec_with_extra_well_known {
     };
 }
 def_spv_spec_with_extra_well_known! {
-    opcode: spv::spec::Opcode = [
-        OpTypeVoid,
-
-        OpConstantComposite,
-
-        OpBitcast,
-        OpCompositeInsert,
-        OpCompositeExtract,
-    ],
     operand_kind: spv::spec::OperandKind = [
         ExecutionModel,
     ],
@@ -401,6 +392,20 @@ fn remove_unused_values_in_func(func_def_body: &mut FuncDefBody) {
                 };
                 let node_def = func_at_node.def();
                 let is_pure = match &node_def.kind {
+                    DataInstKind::Scalar(_)
+                    | DataInstKind::Vector(_)
+                    | DataInstKind::QPtr(
+                        // FIXME(eddyb) this is literally all of them, other than
+                        // `Load`/`Store`, almost as if there's a split between
+                        // "pointer computation" and "memory access".
+                        QPtrOp::FuncLocalVar(_)
+                        | QPtrOp::HandleArrayIndex
+                        | QPtrOp::BufferData
+                        | QPtrOp::BufferDynLen { .. }
+                        | QPtrOp::Offset(_)
+                        | QPtrOp::DynOffset { .. },
+                    ) => true,
+
                     // HACK(eddyb) small selection relevant for now,
                     // but should be extended using e.g. a bitset.
                     DataInstKind::SpvInst(spv_inst) => {
@@ -411,7 +416,7 @@ fn remove_unused_values_in_func(func_def_body: &mut FuncDefBody) {
                     | NodeKind::Loop { .. }
                     | NodeKind::ExitInvocation(spirt::cfg::ExitInvocationKind::SpvInst(_))
                     | DataInstKind::FuncCall(_)
-                    | DataInstKind::QPtr(_)
+                    | DataInstKind::QPtr(QPtrOp::Load | QPtrOp::Store)
                     | DataInstKind::SpvExtInst { .. } => false,
                 };
                 // Ignore pure instructions (i.e. they're only used
@@ -507,7 +512,9 @@ fn remove_unused_values_in_func(func_def_body: &mut FuncDefBody) {
 
             NodeKind::ExitInvocation { .. } => {}
 
-            DataInstKind::FuncCall(_)
+            DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
+            | DataInstKind::FuncCall(_)
             | DataInstKind::QPtr(_)
             | DataInstKind::SpvInst(_)
             | DataInstKind::SpvExtInst { .. } => {
