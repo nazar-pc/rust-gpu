@@ -2742,7 +2742,7 @@ dependencies = [
 [[package]]
 name = "spirt"
 version = "0.4.0"
-source = "git+https://github.com/Rust-GPU/spirt?branch=main#5c4261490c6510cb755fc444a76a5c4d5e06705d"
+source = "git+https://github.com/LykenSol/spirt?rev=b8059383#b8059383dc0a34cd71d791ada0a267fe57be430e"
 dependencies = [
  "arrayvec",
  "bytemuck",
