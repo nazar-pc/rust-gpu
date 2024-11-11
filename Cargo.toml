@@ -95,4 +95,5 @@ codegen-units = 1
 # - WIP: node-attrs
 # - WIP: node-inputs
 # - WIP: node-child_regions
-spirt = { git = "https://github.com/LykenSol/spirt", rev = "36e63927" }
+# - WIP: data-inst-def-outputs
+spirt = { git = "https://github.com/LykenSol/spirt", rev = "809cff7b" }
