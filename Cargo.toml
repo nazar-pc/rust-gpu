@@ -93,4 +93,5 @@ codegen-units = 1
 # - https://github.com/Rust-GPU/spirt/pull/9
 # - https://github.com/Rust-GPU/spirt/pull/12
 # - WIP: node-attrs
-spirt = { git = "https://github.com/LykenSol/spirt", rev = "b8059383" }
+# - WIP: node-inputs
+spirt = { git = "https://github.com/LykenSol/spirt", rev = "f258529b" }
