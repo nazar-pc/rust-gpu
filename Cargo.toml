@@ -85,3 +85,8 @@ codegen-units = 256
 #
 # rustflags = ["-Zshare-generics=off"]
 codegen-units = 1
+
+[patch.crates-io]
+# HACK(eddyb) temporary until a new SPIR-T release contains the following:
+# - https://github.com/Rust-GPU/spirt/pull/7
+spirt = { git = "https://github.com/Rust-GPU/spirt", branch = "main" }
