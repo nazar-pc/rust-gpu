@@ -91,4 +91,5 @@ codegen-units = 1
 # - https://github.com/Rust-GPU/spirt/pull/7
 # - https://github.com/Rust-GPU/spirt/pull/8
 # - https://github.com/Rust-GPU/spirt/pull/9
+# - https://github.com/Rust-GPU/spirt/pull/12
 spirt = { git = "https://github.com/Rust-GPU/spirt", branch = "main" }
