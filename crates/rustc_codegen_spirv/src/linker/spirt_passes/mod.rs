@@ -424,6 +424,11 @@ fn remove_unused_values_in_func(func_def_body: &mut FuncDefBody) {
                             mark_used_and_propagate(v);
                         }
                     }
+
+                    DataInstKind::FuncCall(_)
+                    | DataInstKind::QPtr(_)
+                    | DataInstKind::SpvInst(_)
+                    | DataInstKind::SpvExtInst { .. } => unreachable!(),
                 }
             },
         };
@@ -546,6 +551,11 @@ fn remove_unused_values_in_func(func_def_body: &mut FuncDefBody) {
             }
 
             NodeKind::ExitInvocation { .. } => {}
+
+            DataInstKind::FuncCall(_)
+            | DataInstKind::QPtr(_)
+            | DataInstKind::SpvInst(_)
+            | DataInstKind::SpvExtInst { .. } => unreachable!(),
         }
     }
 
