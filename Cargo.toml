@@ -98,4 +98,5 @@ codegen-units = 1
 # - WIP: data-inst-def-outputs
 # - WIP: data-inst-node-merge
 # - WIP: unblock
-spirt = { git = "https://github.com/LykenSol/spirt", rev = "221ffb26" }
+# - WIP: var-io
+spirt = { git = "https://github.com/LykenSol/spirt", rev = "1141a53c" }

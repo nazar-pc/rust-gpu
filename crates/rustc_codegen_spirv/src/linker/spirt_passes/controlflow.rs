@@ -104,20 +104,21 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
                 .into_iter()
                 .filter_map(|func_at_inst| {
                     let data_inst_def = func_at_inst.def();
-                    if let DataInstKind::SpvInst(spv_inst) = &data_inst_def.kind
-                        && spv_inst.opcode == wk.OpLoad
-                        && let Value::Const(ct) = data_inst_def.inputs[0]
-                        && let ConstKind::PtrToGlobalVar(gv) = cx[ct].kind
-                        && interface_global_vars.contains(&gv)
-                    {
-                        return Some((
-                            gv,
-                            data_inst_def.outputs[0].ty,
-                            Value::NodeOutput {
-                                node: func_at_inst.position,
-                                output_idx: 0,
-                            },
-                        ));
+                    if let DataInstKind::SpvInst(spv_inst) = &data_inst_def.kind {
+                        if spv_inst.opcode == wk.OpLoad {
+                            if let Value::Const(ct) = data_inst_def.inputs[0] {
+                                if let ConstKind::PtrToGlobalVar(gv) = cx[ct].kind {
+                                    if interface_global_vars.contains(&gv) {
+                                        let output_var = data_inst_def.outputs[0];
+                                        return Some((
+                                            gv,
+                                            func_at_inst.at(output_var).decl().ty,
+                                            Value::Var(output_var),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
                     None
                 });
@@ -203,6 +204,7 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
             let func = FuncAt {
                 regions: &func_def_body.regions,
                 nodes: &func_def_body.nodes,
+                vars: &func_def_body.vars,
 
                 position: (),
             };
@@ -250,7 +252,7 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
                     }) => {
                         let const_kind = |v: Value| match v {
                             Value::Const(ct) => &cx[ct].kind,
-                            _ => unreachable!(),
+                            Value::Var(_) => unreachable!(),
                         };
                         let const_str = |v: Value| match const_kind(v) {
                             &ConstKind::SpvStringLiteralForExtInst(s) => s,
