@@ -99,4 +99,6 @@ codegen-units = 1
 # - WIP: data-inst-node-merge
 # - WIP: unblock
 # - WIP: var-io
-spirt = { git = "https://github.com/LykenSol/spirt", rev = "1141a53c" }
+# - WIP: spv-const-op
+# - WIP: spv-const-fn-ptr
+spirt = { git = "https://github.com/LykenSol/spirt", rev = "c11d6a20" }

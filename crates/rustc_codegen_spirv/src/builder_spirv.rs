@@ -624,19 +624,6 @@ impl<'tcx> BuilderSpirv<'tcx> {
 
         // FIXME(eddyb) make this an extension method on `rspirv::dr::Builder`?
         let const_op = |builder: &mut Builder, op, lhs, maybe_rhs: Option<_>| {
-            // HACK(eddyb) remove after `OpSpecConstantOp` support gets added to SPIR-T.
-            let spirt_has_const_op = false;
-
-            if !spirt_has_const_op {
-                let zombie = builder.undef(ty, None);
-                cx.zombie_with_span(
-                    zombie,
-                    DUMMY_SP,
-                    &format!("unsupported constant of type `{}`", cx.debug_type(ty)),
-                );
-                return zombie;
-            }
-
             let id = builder.id();
             builder
                 .module_mut()
@@ -728,25 +715,17 @@ impl<'tcx> BuilderSpirv<'tcx> {
                 func_id,
                 mangled_func_name: _,
             } => {
-                // HACK(eddyb) remove after `OpConstantFunctionPointerINTEL` support gets added to SPIR-T.
-                let spirt_has_const_fn_ptr = false;
-
-                if !spirt_has_const_fn_ptr {
-                    // NOTE(eddyb) zombie will be emitted by `SpirvValue::def_with_span`.
-                    builder.undef(ty, None)
-                } else {
-                    let id = builder.id();
-                    builder
-                        .module_mut()
-                        .types_global_values
-                        .push(Instruction::new(
-                            Op::ConstantFunctionPointerINTEL,
-                            Some(ty),
-                            Some(id),
-                            [Operand::IdRef(func_id)].into(),
-                        ));
-                    id
-                }
+                let id = builder.id();
+                builder
+                    .module_mut()
+                    .types_global_values
+                    .push(Instruction::new(
+                        Op::ConstantFunctionPointerINTEL,
+                        Some(ty),
+                        Some(id),
+                        [Operand::IdRef(func_id)].into(),
+                    ));
+                id
             }
         };
         #[allow(clippy::match_same_arms)]
