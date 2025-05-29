@@ -23,6 +23,7 @@ use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::Symbol;
 use rustc_span::{DUMMY_SP, FileName, FileNameDisplayPreference, SourceFile, Span};
 use std::assert_matches::assert_matches;
+use std::borrow::Cow;
 use std::cell::{RefCell, RefMut};
 use std::hash::{Hash, Hasher};
 use std::iter;
@@ -46,13 +47,6 @@ pub enum SpirvValueKind {
     /// Instead we return this, and trigger an error if we ever end up using the
     /// result of this function call (which we can't).
     IllegalTypeUsed(Word),
-
-    // FIXME(eddyb) this shouldn't be needed, but `rustc_codegen_ssa` still relies
-    // on converting `Function`s to `Value`s even for direct calls, the `Builder`
-    // should just have direct and indirect `call` variants (or a `Callee` enum).
-    FnAddr {
-        function: Word,
-    },
 
     /// Deferred pointer cast, for the `Logical` addressing model (which doesn't
     /// really support raw pointers in the way Rust expects to be able to use).
@@ -161,7 +155,7 @@ impl SpirvValue {
                     IllegalConst::Indirect(cause) => cause.message(),
                 };
 
-                cx.zombie_with_span(id, span, msg);
+                cx.zombie_with_span(id, span, &msg);
 
                 id
             }
@@ -174,18 +168,6 @@ impl SpirvValue {
                     .emit();
 
                 id
-            }
-
-            SpirvValueKind::FnAddr { .. } => {
-                cx.builder
-                    .const_to_id
-                    .borrow()
-                    .get(&WithType {
-                        ty: self.ty,
-                        val: SpirvConst::ZombieUndefForFnAddr,
-                    })
-                    .expect("FnAddr didn't go through proper undef registration")
-                    .val
             }
 
             SpirvValueKind::LogicalPtrCast {
@@ -232,18 +214,30 @@ pub enum SpirvConst<'a, 'tcx> {
     Null,
     Undef,
 
-    /// Like `Undef`, but cached separately to avoid `FnAddr` zombies accidentally
-    /// applying to non-zombie `Undef`s of the same types.
-    // FIXME(eddyb) include the function ID so that multiple `fn` pointers to
-    // different functions, but of the same type, don't overlap their zombies.
-    ZombieUndefForFnAddr,
-
     Composite(&'a [Word]),
 
     /// Pointer to constant data, i.e. `&pointee`, represented as an `OpVariable`
     /// in the `Private` storage class, and with `pointee` as its initializer.
     PtrTo {
         pointee: Word,
+    },
+
+    /// Pointer to the function with ID `func_id`, i.e. `func as fn(...) -> _`,
+    /// represented using `OpConstantFunctionPointerINTEL` and pointer types in
+    /// the `CodeSectionINTEL` storage class, from `SPV_INTEL_function_pointers`
+    /// (an OpenCL extension, but these consts are meant to be legalized away).
+    //
+    // FIXME(eddyb) actually support `OpConstantFunctionPointerINTEL` in SPIR-T
+    // and emit it (right now this uses `OpUndef` to avoid breaking SPIR-T).
+    // HACK(eddyb) silencing `clippy::doc_markdown` due to "OpenCL" false positive.
+    #[allow(clippy::doc_markdown)]
+    PtrToFunc {
+        func_id: Word,
+
+        // HACK(eddyb) tracked only to allow a more useful zombie message.
+        // FIXME(eddyb) once zombies are replaced with errors emitted from a
+        // SPIR-T legality checker, the name can come from the function itself.
+        mangled_func_name: &'tcx str,
     },
 
     /// Symbolic result for the `const_data_from_alloc` method, to allow deferring
@@ -276,8 +270,14 @@ impl<'tcx> SpirvConst<'_, 'tcx> {
             SpirvConst::Scalar(v) => SpirvConst::Scalar(v),
             SpirvConst::Null => SpirvConst::Null,
             SpirvConst::Undef => SpirvConst::Undef,
-            SpirvConst::ZombieUndefForFnAddr => SpirvConst::ZombieUndefForFnAddr,
             SpirvConst::PtrTo { pointee } => SpirvConst::PtrTo { pointee },
+            SpirvConst::PtrToFunc {
+                func_id,
+                mangled_func_name,
+            } => SpirvConst::PtrToFunc {
+                func_id,
+                mangled_func_name,
+            },
 
             SpirvConst::Composite(fields) => SpirvConst::Composite(arena_alloc_slice(cx, fields)),
 
@@ -294,12 +294,20 @@ struct WithType<V> {
 
 /// Primary causes for a `SpirvConst` to be deemed illegal.
 #[derive(Copy, Clone, Debug)]
-enum LeafIllegalConst {
+enum LeafIllegalConst<'tcx> {
     /// `SpirvConst::Composite` containing a `SpirvConst::PtrTo` as a field.
     /// This is illegal because `OpConstantComposite` must have other constants
     /// as its operands, and `OpVariable`s are never considered constant.
     // FIXME(eddyb) figure out if this is an accidental omission in SPIR-V.
     CompositeContainsPtrTo,
+
+    /// `PtrToFunc` constant, which is not legal in SPIR-V (without the extension
+    /// `SPV_INTEL_function_pointers`, which is not expected to be realistically
+    /// present outside of Intel's OpenCL/SYCL implementation, and which will at
+    /// most be used to pass such constants through to SPIR-T for legalization).
+    //
+    // FIXME(eddyb) legalize function pointers (and emulate recursion) in SPIR-T.
+    PtrToFunc { mangled_func_name: &'tcx str },
 
     /// `ConstDataFromAlloc` constant, which cannot currently be materialized
     /// to SPIR-V (and requires to be wrapped in `PtrTo` and bitcast, first).
@@ -308,38 +316,44 @@ enum LeafIllegalConst {
     UntypedConstDataFromAlloc,
 }
 
-impl LeafIllegalConst {
-    fn message(&self) -> &'static str {
+impl LeafIllegalConst<'_> {
+    fn message(&self) -> Cow<'static, str> {
         match *self {
             Self::CompositeContainsPtrTo => {
-                "constant arrays/structs cannot contain pointers to other constants"
+                "constant arrays/structs cannot contain pointers to other constants".into()
+            }
+            Self::PtrToFunc { mangled_func_name } => {
+                let demangled_func_name =
+                    format!("{:#}", rustc_demangle::demangle(mangled_func_name));
+                format!("unsupported function pointer to `{demangled_func_name}`").into()
             }
             Self::UntypedConstDataFromAlloc => {
                 "`const_data_from_alloc` result wasn't passed through `static_addr_of`, \
                  then `const_bitcast` (which would've given it a type)"
+                    .into()
             }
         }
     }
 }
 
 #[derive(Copy, Clone, Debug)]
-enum IllegalConst {
+enum IllegalConst<'tcx> {
     /// This `SpirvConst` is (or contains) a "leaf" illegal constant. As there
     /// is no indirection, some of these could still be materialized at runtime,
     /// using e.g. `OpCompositeConstruct` instead of `OpConstantComposite`.
-    Shallow(LeafIllegalConst),
+    Shallow(LeafIllegalConst<'tcx>),
 
     /// This `SpirvConst` is (or contains/points to) a `PtrTo` which points to
     /// a "leaf" illegal constant. As the data would have to live for `'static`,
     /// there is no way to materialize it as a pointer in SPIR-V. However, it
     /// could still be legalized during codegen by e.g. folding loads from it.
-    Indirect(LeafIllegalConst),
+    Indirect(LeafIllegalConst<'tcx>),
 }
 
 #[derive(Copy, Clone, Debug)]
-struct WithConstLegality<V> {
+struct WithConstLegality<'tcx, V> {
     val: V,
-    legal: Result<(), IllegalConst>,
+    legal: Result<(), IllegalConst<'tcx>>,
 }
 
 /// `HashMap` key type (for `debug_file_cache` in `BuilderSpirv`), which is
@@ -419,8 +433,9 @@ pub struct BuilderSpirv<'tcx> {
     // (e.g. `OpConstant...`) instruction.
     // NOTE(eddyb) both maps have `WithConstLegality` around their keys, which
     // allows getting that legality information without additional lookups.
-    const_to_id: RefCell<FxHashMap<WithType<SpirvConst<'tcx, 'tcx>>, WithConstLegality<Word>>>,
-    id_to_const: RefCell<FxHashMap<Word, WithConstLegality<SpirvConst<'tcx, 'tcx>>>>,
+    const_to_id:
+        RefCell<FxHashMap<WithType<SpirvConst<'tcx, 'tcx>>, WithConstLegality<'tcx, Word>>>,
+    id_to_const: RefCell<FxHashMap<Word, WithConstLegality<'tcx, SpirvConst<'tcx, 'tcx>>>>,
 
     debug_file_cache: RefCell<FxHashMap<DebugFileKey, DebugFileSpirv<'tcx>>>,
 
@@ -679,14 +694,37 @@ impl<'tcx> BuilderSpirv<'tcx> {
             },
 
             SpirvConst::Null => builder.constant_null(ty),
-            SpirvConst::Undef
-            | SpirvConst::ZombieUndefForFnAddr
-            | SpirvConst::ConstDataFromAlloc(_) => builder.undef(ty, None),
+            SpirvConst::Undef | SpirvConst::ConstDataFromAlloc(_) => builder.undef(ty, None),
 
             SpirvConst::Composite(v) => builder.constant_composite(ty, v.iter().copied()),
 
             SpirvConst::PtrTo { pointee } => {
                 builder.variable(ty, None, StorageClass::Private, Some(pointee))
+            }
+
+            SpirvConst::PtrToFunc {
+                func_id,
+                mangled_func_name: _,
+            } => {
+                // HACK(eddyb) remove after `OpConstantFunctionPointerINTEL` support gets added to SPIR-T.
+                let spirt_has_const_fn_ptr = false;
+
+                if !spirt_has_const_fn_ptr {
+                    // NOTE(eddyb) zombie will be emitted by `SpirvValue::def_with_span`.
+                    builder.undef(ty, None)
+                } else {
+                    let id = builder.id();
+                    builder
+                        .module_mut()
+                        .types_global_values
+                        .push(Instruction::new(
+                            Op::ConstantFunctionPointerINTEL,
+                            Some(ty),
+                            Some(id),
+                            [Operand::IdRef(func_id)].into(),
+                        ));
+                    id
+                }
             }
         };
         #[allow(clippy::match_same_arms)]
@@ -699,14 +737,6 @@ impl<'tcx> BuilderSpirv<'tcx> {
             }
             SpirvConst::Undef => {
                 // FIXME(eddyb) check that the type supports `OpUndef`.
-                Ok(())
-            }
-
-            SpirvConst::ZombieUndefForFnAddr => {
-                // This can be considered legal as it's already marked as zombie.
-                // FIXME(eddyb) is it possible for the original zombie to lack a
-                // span, and should we go through `IllegalConst` in order to be
-                // able to attach a proper usesite span?
                 Ok(())
             }
 
@@ -753,6 +783,13 @@ impl<'tcx> BuilderSpirv<'tcx> {
                     Err(IllegalConst::Indirect(cause))
                 }
             },
+
+            SpirvConst::PtrToFunc {
+                func_id: _,
+                mangled_func_name,
+            } => Err(IllegalConst::Shallow(LeafIllegalConst::PtrToFunc {
+                mangled_func_name,
+            })),
 
             SpirvConst::ConstDataFromAlloc(_) => Err(IllegalConst::Shallow(
                 LeafIllegalConst::UntypedConstDataFromAlloc,

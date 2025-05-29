@@ -4,7 +4,7 @@ mod entry;
 mod type_;
 
 use crate::builder::{ExtInst, InstructionTable};
-use crate::builder_spirv::{BuilderCursor, BuilderSpirv, SpirvConst, SpirvValue, SpirvValueKind};
+use crate::builder_spirv::{BuilderCursor, BuilderSpirv, SpirvConst, SpirvValue};
 use crate::custom_decorations::{CustomDecoration, SrcLocDecoration, ZombieDecoration};
 use crate::spirv_type::{SpirvType, SpirvTypePrinter, TypeCache};
 use crate::symbols::Symbols;
@@ -862,9 +862,6 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
         self.get_fn_ext(instance)
     }
 
-    // NOTE(eddyb) see the comment on `SpirvValueKind::FnAddr`, this should
-    // be fixed upstream, so we never see any "function pointer" values being
-    // created just to perform direct calls.
     fn get_fn_addr(&self, instance: Instance<'tcx>) -> Self::Value {
         let function = self.get_fn(instance);
         let span = self.tcx.def_span(instance.def_id());
@@ -874,16 +871,13 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
         }
         .def(span, self);
 
-        // Create these `OpUndef`s up front, instead of on-demand in `SpirvValue::def`,
-        // because `SpirvValue::def` can't use `cx.emit()`.
-        self.def_constant(ty, SpirvConst::ZombieUndefForFnAddr);
-
-        SpirvValue {
-            kind: SpirvValueKind::FnAddr {
-                function: function.def_cx(self),
-            },
+        self.def_constant(
             ty,
-        }
+            SpirvConst::PtrToFunc {
+                func_id: function.def_cx(self),
+                mangled_func_name: self.tcx.symbol_name(instance).name,
+            },
+        )
     }
 
     fn eh_personality(&self) -> Self::Value {
