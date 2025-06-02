@@ -256,7 +256,7 @@ pub fn link(
         }
 
         // merge the binaries
-        let mut loader = Loader::new();
+        let mut loader = crate::link::RspirvLoaderWithUnsupportedTypesConstsBypass::default();
 
         for module in inputs {
             module.all_inst_iter().for_each(|inst| {
