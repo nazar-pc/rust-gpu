@@ -427,7 +427,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) -> Option<(SpirvValue, <Self as BackendTypes>::Type)> {
         let ptr = ptr.strip_ptrcasts();
         let mut leaf_ty = match self.lookup_type(ptr.ty) {
-            SpirvType::Pointer { pointee } => pointee,
+            SpirvType::Pointer { pointee, .. } => pointee,
             other => self.fatal(format!("`ptr` is non-pointer type: {other:?}")),
         };
 
@@ -709,7 +709,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             // a whole `OpVariable`, or the result of a previous `OpAccessChain`).
             let original_ptr = ptr.strip_ptrcasts();
             let original_pointee_ty = match self.lookup_type(original_ptr.ty) {
-                SpirvType::Pointer { pointee } => pointee,
+                SpirvType::Pointer { pointee, .. } => pointee,
                 other => self.fatal(format!("pointer arithmetic on non-pointer type {other:?}")),
             };
 
@@ -2183,13 +2183,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
 
         let ptr_pointee = match self.lookup_type(ptr.ty) {
-            SpirvType::Pointer { pointee } => pointee,
+            SpirvType::Pointer { pointee, .. } => pointee,
             other => self.fatal(format!(
                 "pointercast called on non-pointer source type: {other:?}"
             )),
         };
         let dest_pointee = match self.lookup_type(dest_ty) {
-            SpirvType::Pointer { pointee } => pointee,
+            SpirvType::Pointer { pointee, .. } => pointee,
             other => self.fatal(format!(
                 "pointercast called on non-pointer dest type: {other:?}"
             )),
@@ -2617,7 +2617,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             .and_then(|size| Some(Size::from_bytes(u64::try_from(size).ok()?)));
 
         let elem_ty = match self.lookup_type(ptr.ty) {
-            SpirvType::Pointer { pointee } => pointee,
+            SpirvType::Pointer { pointee, .. } => pointee,
             _ => self.fatal(format!(
                 "memset called on non-pointer type: {}",
                 self.debug_type(ptr.ty)
@@ -2987,7 +2987,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 (callee.def(self), return_type, arguments)
             }
 
-            SpirvType::Pointer { pointee } => match self.lookup_type(pointee) {
+            SpirvType::Pointer { pointee, .. } => match self.lookup_type(pointee) {
                 SpirvType::Function {
                     return_type,
                     arguments,

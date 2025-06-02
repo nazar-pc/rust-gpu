@@ -12,7 +12,7 @@ use rspirv::spirv::{
     AddressingModel, Capability, MemoryModel, Op, SourceLanguage, StorageClass, Word,
 };
 use rspirv::{binary::Assemble, binary::Disassemble};
-use rustc_abi::Size;
+use rustc_abi::{HasDataLayout as _, Size};
 use rustc_arena::DroplessArena;
 use rustc_codegen_ssa::traits::ConstCodegenMethods as _;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -95,7 +95,7 @@ impl SpirvValue {
                 match entry.val {
                     SpirvConst::PtrTo { pointee } => {
                         let ty = match cx.lookup_type(self.ty) {
-                            SpirvType::Pointer { pointee } => pointee,
+                            SpirvType::Pointer { pointee, .. } => pointee,
                             ty => bug!("load called on value that wasn't a pointer: {:?}", ty),
                         };
                         // FIXME(eddyb) deduplicate this `if`-`else` and its other copies.
@@ -129,7 +129,29 @@ impl SpirvValue {
 
     pub fn def_with_span(self, cx: &CodegenCx<'_>, span: Span) -> Word {
         match self.kind {
-            SpirvValueKind::Def(id) => id,
+            SpirvValueKind::Def(id) => {
+                // HACK(eddyb) if this is an otherwise-legal value, with no other
+                // zombies, *but* it happens to be of a type which mainly relies
+                // on e.g. illegal consts for diagnostics, this allows emitting
+                // zombies on the other values of that type, without burdening
+                // the type def with a zombie (redundant more often than not).
+                // FIXME(eddyb) this may pose a non-trivial cost, do we have a
+                // a way to even measure/track the initial codegen performance?
+                let legal_type = match cx.lookup_type(self.ty) {
+                    SpirvType::Pointer {
+                        pointee: _,
+                        addr_space,
+                    } if addr_space == cx.data_layout().instruction_address_space => {
+                        Err("function pointers are not supported in SPIR-V")
+                    }
+                    _ => Ok(()),
+                };
+                if let Err(msg) = legal_type {
+                    cx.zombie_with_span(id, span, msg);
+                }
+
+                id
+            }
 
             SpirvValueKind::IllegalConst(id) => {
                 let entry = &cx.builder.id_to_const.borrow()[&id];
