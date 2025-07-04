@@ -12,11 +12,11 @@ pub use spirv_asm::InstructionTable;
 // HACK(eddyb) avoids rewriting all of the imports (see `lib.rs` and `build.rs`).
 use crate::maybe_pqp_cg_ssa as rustc_codegen_ssa;
 
-use crate::abi::ConvSpirvType;
 use crate::builder_spirv::{BuilderCursor, SpirvValue, SpirvValueExt};
 use crate::codegen_cx::CodegenCx;
 use crate::spirv_type::SpirvType;
 use rspirv::spirv::Word;
+use rustc_abi::{AddressSpace, HasDataLayout, Size, TargetDataLayout};
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::PlaceRef;
 use rustc_codegen_ssa::traits::{
@@ -34,8 +34,7 @@ use rustc_middle::ty::layout::{
 use rustc_middle::ty::{Instance, Ty, TyCtxt, TypingEnv};
 use rustc_span::Span;
 use rustc_span::def_id::DefId;
-use rustc_target::abi::call::{ArgAbi, FnAbi, PassMode};
-use rustc_target::abi::{HasDataLayout, Size, TargetDataLayout};
+use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
 use rustc_target::spec::{HasTargetSpec, Target};
 use std::ops::{Deref, Range};
 
@@ -58,6 +57,24 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         } else {
             self.zombie_no_span(word, reason);
         }
+    }
+
+    pub fn undef_zombie(&self, word: Word, reason: &str) -> SpirvValue {
+        if let Some(current_span) = self.current_span {
+            self.undef_zombie_with_span(word, current_span, reason)
+        } else {
+            self.undef_zombie_no_span(word, reason)
+        }
+    }
+    pub fn undef_zombie_with_span(&self, ty: Word, span: Span, reason: &str) -> SpirvValue {
+        let undef = self.undef(ty);
+        self.zombie_with_span(undef.def(self), span, reason);
+        undef
+    }
+    pub fn undef_zombie_no_span(&self, ty: Word, reason: &str) -> SpirvValue {
+        let undef = self.undef(ty);
+        self.zombie_no_span(undef.def(self), reason);
+        undef
     }
 
     pub fn validate_atomic(&self, ty: Word, to_zombie: Word) {
@@ -104,7 +121,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     // HACK(eddyb) like the `CodegenCx` method but with `self.span()` awareness.
     pub fn type_ptr_to(&self, ty: Word) -> Word {
-        SpirvType::Pointer { pointee: ty }.def(self.span(), self)
+        SpirvType::Pointer {
+            pointee: ty,
+            addr_space: AddressSpace::DATA,
+        }
+        .def(self.span(), self)
     }
 
     // TODO: Definitely add tests to make sure this impl is right.
@@ -175,10 +196,6 @@ impl<'a, 'tcx> DebugInfoBuilderMethods for Builder<'a, 'tcx> {
         todo!()
     }
 
-    fn get_dbg_loc(&self) -> Option<Self::DILocation> {
-        None
-    }
-
     fn insert_reference_to_gdb_debug_scripts_section_global(&mut self) {
         todo!()
     }
@@ -236,13 +253,9 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             ),
         }
     }
-
-    fn arg_memory_ty(&self, arg_abi: &ArgAbi<'tcx, Ty<'tcx>>) -> Self::Type {
-        arg_abi.layout.spirv_type(self.span(), self)
-    }
 }
 
-impl<'a, 'tcx> AbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
+impl AbiBuilderMethods for Builder<'_, '_> {
     fn get_param(&mut self, index: usize) -> Self::Value {
         self.function_parameter_values.borrow()[&self.current_fn.def(self)][index]
     }

@@ -5,7 +5,8 @@ use crate::codegen_cx::{CodegenArgs, SpirvMetadata};
 use crate::{SpirvCodegenBackend, SpirvModuleBuffer, SpirvThinBuffer, linker};
 use ar::{Archive, GnuBuilder, Header};
 use rspirv::binary::Assemble;
-use rspirv::dr::Module;
+use rspirv::dr::{Module, Operand};
+use rspirv::spirv::Op;
 use rustc_ast::CRATE_NODE_ID;
 use rustc_codegen_spirv_types::{CompileResult, ModuleResult};
 use rustc_codegen_ssa::back::lto::{LtoModuleCodegen, SerializedModule, ThinModule, ThinShared};
@@ -13,7 +14,7 @@ use rustc_codegen_ssa::back::write::CodegenContext;
 use rustc_codegen_ssa::{CodegenResults, NativeLib};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{Diag, FatalError};
-use rustc_metadata::fs::METADATA_FILENAME;
+use rustc_metadata::{EncodedMetadata, fs::METADATA_FILENAME};
 use rustc_middle::bug;
 use rustc_middle::dep_graph::WorkProduct;
 use rustc_middle::middle::dependency_format::Linkage;
@@ -35,6 +36,7 @@ use std::sync::Arc;
 pub fn link(
     sess: &Session,
     codegen_results: &CodegenResults,
+    metadata: &EncodedMetadata,
     outputs: &OutputFilenames,
     crate_name: &str,
 ) {
@@ -65,11 +67,20 @@ pub fn link(
 
         if outputs.outputs.should_codegen() {
             let out_filename = out_filename(sess, crate_type, outputs, Symbol::intern(crate_name));
-            let out_filename_file_for_writing =
-                out_filename.file_for_writing(outputs, OutputType::Exe, None);
+            let out_filename_file_for_writing = out_filename.file_for_writing(
+                outputs,
+                OutputType::Exe,
+                crate_name,
+                sess.invocation_temp.as_deref(),
+            );
             match crate_type {
                 CrateType::Rlib => {
-                    link_rlib(sess, codegen_results, &out_filename_file_for_writing);
+                    link_rlib(
+                        sess,
+                        codegen_results,
+                        metadata,
+                        &out_filename_file_for_writing,
+                    );
                 }
                 CrateType::Executable | CrateType::Cdylib | CrateType::Dylib => {
                     // HACK(eddyb) there's no way way to access `outputs.filestem`,
@@ -113,7 +124,12 @@ pub fn link(
     }
 }
 
-fn link_rlib(sess: &Session, codegen_results: &CodegenResults, out_filename: &Path) {
+fn link_rlib(
+    sess: &Session,
+    codegen_results: &CodegenResults,
+    metadata: &EncodedMetadata,
+    out_filename: &Path,
+) {
     let mut file_list = Vec::<&Path>::new();
     for obj in codegen_results
         .modules
@@ -135,11 +151,7 @@ fn link_rlib(sess: &Session, codegen_results: &CodegenResults, out_filename: &Pa
         }
     }
 
-    create_archive(
-        &file_list,
-        codegen_results.metadata.raw_data(),
-        out_filename,
-    );
+    create_archive(&file_list, metadata.stub_or_full(), out_filename);
 }
 
 fn link_exe(
@@ -329,7 +341,7 @@ fn do_spirv_opt(
 
     match sess.opts.optimize {
         OptLevel::No => {}
-        OptLevel::Less | OptLevel::Default | OptLevel::Aggressive => {
+        OptLevel::Less | OptLevel::More | OptLevel::Aggressive => {
             optimizer.register_performance_passes();
         }
         OptLevel::Size | OptLevel::SizeMin => {
@@ -427,15 +439,14 @@ fn add_upstream_rust_crates(
     codegen_results: &CodegenResults,
     crate_type: CrateType,
 ) {
-    let (_, data) = codegen_results
+    let data = codegen_results
         .crate_info
         .dependency_formats
-        .iter()
-        .find(|(ty, _)| *ty == crate_type)
+        .get(&crate_type)
         .expect("failed to find crate type in dependency format list");
     for &cnum in &codegen_results.crate_info.used_crates {
         let src = &codegen_results.crate_info.used_crate_source[&cnum];
-        match data[cnum.as_usize() - 1] {
+        match data[cnum] {
             Linkage::NotLinked | Linkage::IncludedFromDylib => {}
             Linkage::Static => rlibs.push(src.rlib.as_ref().unwrap().0.clone()),
             //Linkage::Dynamic => rlibs.push(src.dylib.as_ref().unwrap().0.clone()),
@@ -451,11 +462,10 @@ fn add_upstream_native_libraries(
     codegen_results: &CodegenResults,
     crate_type: CrateType,
 ) {
-    let (_, data) = codegen_results
+    let data = codegen_results
         .crate_info
         .dependency_formats
-        .iter()
-        .find(|(ty, _)| *ty == crate_type)
+        .get(&crate_type)
         .expect("failed to find crate type in dependency format list");
 
     for &cnum in &codegen_results.crate_info.used_crates {
@@ -467,7 +477,7 @@ fn add_upstream_native_libraries(
                 NativeLibKind::Static {
                     bundle: Some(false),
                     ..
-                } if data[cnum.as_usize() - 1] != Linkage::Static => {}
+                } if data[cnum] != Linkage::Static => {}
 
                 NativeLibKind::Static {
                     bundle: None | Some(true),
@@ -487,7 +497,7 @@ fn add_upstream_native_libraries(
 // (see `compiler/rustc_codegen_ssa/src/back/link.rs`)
 fn relevant_lib(sess: &Session, lib: &NativeLib) -> bool {
     match lib.cfg {
-        Some(ref cfg) => rustc_attr::cfg_matches(cfg, sess, CRATE_NODE_ID, None),
+        Some(ref cfg) => rustc_attr_parsing::cfg_matches(cfg, sess, CRATE_NODE_ID, None),
         None => true,
     }
 }
@@ -539,6 +549,81 @@ fn create_archive(files: &[&Path], metadata: &[u8], out_filename: &Path) {
     builder.into_inner().unwrap();
 }
 
+// HACK(eddyb) `rspirv`'s definitions of SPIR-V type/const instructions are
+// hardcoded *and* too narrow, compared to e.g. the SPIR-T ones (which rely
+// on *the combination* of `Type-Declaration`/`Constant-Creation` categories
+// *and* instruction name prefixes), so this `Consumer` adapter wraps those
+// instructions in `OpSpecConstantOp`, and then later unwraps all of them to
+// their original opcodes (this only works for type-declaring instructions,
+// as well, because `dr::Loader` only looks at the opcode and will always
+// push both types and consts to `types_global_values`, without distinction).
+// HACK(eddyb) `pub(crate)` just so `linker::link` can use it for module merging.
+#[derive(Default)]
+pub(crate) struct RspirvLoaderWithUnsupportedTypesConstsBypass(rspirv::dr::Loader);
+
+impl rspirv::binary::Consumer for RspirvLoaderWithUnsupportedTypesConstsBypass {
+    fn initialize(&mut self) -> rspirv::binary::ParseAction {
+        self.0.initialize()
+    }
+
+    fn finalize(&mut self) -> rspirv::binary::ParseAction {
+        self.0.finalize()
+    }
+
+    fn consume_header(&mut self, header: rspirv::dr::ModuleHeader) -> rspirv::binary::ParseAction {
+        self.0.consume_header(header)
+    }
+
+    fn consume_instruction(
+        &mut self,
+        mut inst: rspirv::dr::Instruction,
+    ) -> rspirv::binary::ParseAction {
+        use spirt::spv::spec;
+
+        // HACK(eddyb) as to make unwrapping trivial later on, `OpSpecConstantOp`
+        // is itself also wrapped (resulting in two `LiteralSpecConstantOpInteger`),
+        // which works just as well as wrapping types does: the invalid instructions
+        // are never inspected beyond their opcode being used to determine placement.
+        let opcode = inst.class.opcode;
+        let wrap_in_spec_const_op = opcode == Op::SpecConstantOp
+            || spec::Opcode::try_from_u16_with_name_and_def(opcode as u16).is_some_and(
+                |(_, _, def)| match def.category {
+                    spec::InstructionCategory::Type => !rspirv::grammar::reflect::is_type(opcode),
+                    spec::InstructionCategory::Const => {
+                        !rspirv::grammar::reflect::is_constant(opcode)
+                    }
+                    spec::InstructionCategory::ControlFlow | spec::InstructionCategory::Other => {
+                        false
+                    }
+                },
+            );
+
+        if wrap_in_spec_const_op {
+            inst.class = rspirv::grammar::CoreInstructionTable::get(Op::SpecConstantOp);
+            inst.operands
+                .insert(0, Operand::LiteralSpecConstantOpInteger(opcode));
+        }
+
+        self.0.consume_instruction(inst)
+    }
+}
+
+impl RspirvLoaderWithUnsupportedTypesConstsBypass {
+    pub(crate) fn module(self) -> Module {
+        let mut module = self.0.module();
+        for inst in &mut module.types_global_values {
+            // HACK(eddyb) see `consume_instruction` above for why this is unconditional.
+            if inst.class.opcode == Op::SpecConstantOp {
+                if let [Operand::LiteralSpecConstantOpInteger(opcode), ..] = inst.operands[..] {
+                    inst.class = rspirv::grammar::CoreInstructionTable::get(opcode);
+                    inst.operands.remove(0);
+                }
+            }
+        }
+        module
+    }
+}
+
 /// This is the actual guts of linking: the rest of the link-related functions are just digging through rustc's
 /// shenanigans to collect all the object files we need to link.
 fn do_link(
@@ -554,7 +639,7 @@ fn do_link(
     let mut modules = Vec::new();
     let mut add_module = |file_name: &OsStr, bytes: &[u8]| {
         let module = {
-            let mut loader = rspirv::dr::Loader::new();
+            let mut loader = RspirvLoaderWithUnsupportedTypesConstsBypass::default();
             rspirv::binary::parse_bytes(bytes, &mut loader).unwrap();
             loader.module()
         };

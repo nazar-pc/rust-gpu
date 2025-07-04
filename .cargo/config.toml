@@ -1,5 +1,18 @@
 [alias]
 compiletest = "run --release -p compiletests --"
+difftest = "run --release -p difftests --"
+
+
+[target.x86_64-pc-windows-msvc]
+# Using Rust's LLD linker to avoid MSVC linker limitations
+linker = "rust-lld.exe"
+rustflags = [
+    # Disables cross-crate generic sharing to work around Windows PE export limits.
+    # Should prevent:
+    # - LNK1189 (too many objects)
+    # - LNK1248 (too many exports)
+    "-Zshare-generics=n", # =off is also an option, but you're going to increase binary size in doing so.
+]
 
 [target.'cfg(all())']
 rustflags = [
@@ -44,7 +57,6 @@ rustflags = [
     "-Wclippy::map_err_ignore",
     "-Wclippy::map_flatten",
     "-Wclippy::map_unwrap_or",
-    "-Wclippy::match_on_vec_items",
     "-Wclippy::match_same_arms",
     "-Wclippy::match_wild_err_arm",
     "-Wclippy::match_wildcard_for_single_variants",

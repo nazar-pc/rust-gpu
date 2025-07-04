@@ -19,7 +19,7 @@ use rustc_middle::span_bug;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Instance, Ty};
 use rustc_span::Span;
-use rustc_target::abi::call::{ArgAbi, FnAbi, PassMode};
+use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
 use std::assert_matches::assert_matches;
 
 /// Various information about an entry-point parameter, which can only be deduced
@@ -82,7 +82,7 @@ impl<'tcx> CodegenCx<'tcx> {
                     .span_err(span, format!("cannot declare {name} as an entry point"));
                 return;
             };
-            self.tcx.hir().body_owned_by(fn_local_def_id).params
+            self.tcx.hir_body_owned_by(fn_local_def_id).params
         };
         for (arg_abi, hir_param) in fn_abi.args.iter().zip(hir_params) {
             match arg_abi.mode {
@@ -354,10 +354,13 @@ impl<'tcx> CodegenCx<'tcx> {
             if !ref_is_read_only && storage_class_requires_read_only {
                 let mut err = self.tcx.dcx().struct_span_err(
                     hir_param.ty_span,
-                    format!("entry-point requires {}...", match explicit_mutbl {
-                        hir::Mutability::Not => "interior mutability",
-                        hir::Mutability::Mut => "a mutable reference",
-                    }),
+                    format!(
+                        "entry-point requires {}...",
+                        match explicit_mutbl {
+                            hir::Mutability::Not => "interior mutability",
+                            hir::Mutability::Mut => "a mutable reference",
+                        }
+                    ),
                 );
                 {
                     let note_message =
@@ -426,7 +429,7 @@ impl<'tcx> CodegenCx<'tcx> {
         call_args: &mut Vec<SpirvValue>,
         decoration_locations: &mut FxHashMap<StorageClass, u32>,
     ) {
-        let attrs = AggregatedSpirvAttributes::parse(self, self.tcx.hir().attrs(hir_param.hir_id));
+        let attrs = AggregatedSpirvAttributes::parse(self, self.tcx.hir_attrs(hir_param.hir_id));
 
         let EntryParamDeducedFromRustRefOrValue {
             value_layout,
@@ -445,9 +448,11 @@ impl<'tcx> CodegenCx<'tcx> {
                 let mut emit = self.emit_global();
                 let spec_const_id =
                     emit.spec_constant_bit32(value_spirv_type, default.unwrap_or(0));
-                emit.decorate(spec_const_id, Decoration::SpecId, [Operand::LiteralBit32(
-                    id,
-                )]);
+                emit.decorate(
+                    spec_const_id,
+                    Decoration::SpecId,
+                    [Operand::LiteralBit32(id)],
+                );
                 (
                     Err("`#[spirv(spec_constant)]` is not an entry-point interface variable"),
                     Ok(spec_const_id),
@@ -732,6 +737,38 @@ impl<'tcx> CodegenCx<'tcx> {
             self.emit_global()
                 .decorate(var_id.unwrap(), Decoration::Invariant, std::iter::empty());
         }
+        if let Some(per_primitive_ext) = attrs.per_primitive_ext {
+            match execution_model {
+                ExecutionModel::Fragment => {
+                    if storage_class != Ok(StorageClass::Input) {
+                        self.tcx.dcx().span_fatal(
+                            per_primitive_ext.span,
+                            "`#[spirv(per_primitive_ext)]` in fragment shaders is only valid on Input variables",
+                        );
+                    }
+                }
+                ExecutionModel::MeshNV | ExecutionModel::MeshEXT => {
+                    if storage_class != Ok(StorageClass::Output) {
+                        self.tcx.dcx().span_fatal(
+                            per_primitive_ext.span,
+                            "`#[spirv(per_primitive_ext)]` in mesh shaders is only valid on Output variables",
+                        );
+                    }
+                }
+                _ => {
+                    self.tcx.dcx().span_fatal(
+                        per_primitive_ext.span,
+                        "`#[spirv(per_primitive_ext)]` is only valid in fragment or mesh shaders",
+                    );
+                }
+            }
+
+            self.emit_global().decorate(
+                var_id.unwrap(),
+                Decoration::PerPrimitiveEXT,
+                std::iter::empty(),
+            );
+        }
 
         let is_subpass_input = match self.lookup_type(value_spirv_type) {
             SpirvType::Image {
@@ -740,10 +777,13 @@ impl<'tcx> CodegenCx<'tcx> {
             } => true,
             SpirvType::RuntimeArray { element: elt, .. }
             | SpirvType::Array { element: elt, .. } => {
-                matches!(self.lookup_type(elt), SpirvType::Image {
-                    dim: Dim::DimSubpassData,
-                    ..
-                })
+                matches!(
+                    self.lookup_type(elt),
+                    SpirvType::Image {
+                        dim: Dim::DimSubpassData,
+                        ..
+                    }
+                )
             }
             _ => false,
         };
@@ -935,7 +975,9 @@ impl<'tcx> CodegenCx<'tcx> {
                 | SpirvType::Matrix { element, .. }
                 | SpirvType::Array { element, .. }
                 | SpirvType::RuntimeArray { element }
-                | SpirvType::Pointer { pointee: element }
+                | SpirvType::Pointer {
+                    pointee: element, ..
+                }
                 | SpirvType::InterfaceBlock {
                     inner_type: element,
                 } => recurse(cx, element, has_bool, must_be_flat),

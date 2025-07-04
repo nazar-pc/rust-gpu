@@ -6,12 +6,12 @@ use crate::abi::ConvSpirvType;
 use crate::builder_spirv::{SpirvConst, SpirvValue, SpirvValueExt, SpirvValueKind};
 use crate::spirv_type::SpirvType;
 use rspirv::spirv::Word;
+use rustc_abi::{self as abi, AddressSpace, Float, HasDataLayout, Integer, Primitive, Size};
 use rustc_codegen_ssa::traits::{ConstCodegenMethods, MiscCodegenMethods, StaticCodegenMethods};
 use rustc_middle::bug;
 use rustc_middle::mir::interpret::{ConstAllocation, GlobalAlloc, Scalar, alloc_range};
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_span::{DUMMY_SP, Span};
-use rustc_target::abi::{self, AddressSpace, Float, HasDataLayout, Integer, Primitive, Size};
 
 impl<'tcx> CodegenCx<'tcx> {
     pub fn def_constant(&self, ty: Word, val: SpirvConst<'_, 'tcx>) -> SpirvValue {
@@ -42,6 +42,10 @@ impl<'tcx> CodegenCx<'tcx> {
         self.constant_int_from_native_unsigned(span, val)
     }
 
+    pub fn constant_i64(&self, span: Span, val: i64) -> SpirvValue {
+        self.constant_int_from_native_signed(span, val)
+    }
+
     pub fn constant_u64(&self, span: Span, val: u64) -> SpirvValue {
         self.constant_int_from_native_unsigned(span, val)
     }
@@ -54,7 +58,7 @@ impl<'tcx> CodegenCx<'tcx> {
 
     fn constant_int_from_native_signed(&self, span: Span, val: impl Into<i128>) -> SpirvValue {
         let size = Size::from_bytes(std::mem::size_of_val(&val));
-        let ty = SpirvType::Integer(size.bits() as u32, false).def(span, self);
+        let ty = SpirvType::Integer(size.bits() as u32, true).def(span, self);
         self.constant_int(ty, val.into() as u128)
     }
 
@@ -105,7 +109,7 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 }
 
-impl<'tcx> ConstCodegenMethods<'tcx> for CodegenCx<'tcx> {
+impl ConstCodegenMethods for CodegenCx<'_> {
     fn const_null(&self, t: Self::Type) -> Self::Value {
         self.constant_null(t)
     }
@@ -165,11 +169,17 @@ impl<'tcx> ConstCodegenMethods<'tcx> for CodegenCx<'tcx> {
             .layout_of(self.tcx.types.str_)
             .spirv_type(DUMMY_SP, self);
         (
-            self.def_constant(self.type_ptr_to(str_ty), SpirvConst::PtrTo {
-                pointee: self
-                    .constant_composite(str_ty, s.bytes().map(|b| self.const_u8(b).def_cx(self)))
-                    .def_cx(self),
-            }),
+            self.def_constant(
+                self.type_ptr_to(str_ty),
+                SpirvConst::PtrTo {
+                    pointee: self
+                        .constant_composite(
+                            str_ty,
+                            s.bytes().map(|b| self.const_u8(b).def_cx(self)),
+                        )
+                        .def_cx(self),
+                },
+            ),
             self.const_usize(len as u64),
         )
     }
@@ -239,7 +249,7 @@ impl<'tcx> ConstCodegenMethods<'tcx> for CodegenCx<'tcx> {
                 let (base_addr, _base_addr_space) = match self.tcx.global_alloc(alloc_id) {
                     GlobalAlloc::Memory(alloc) => {
                         let pointee = match self.lookup_type(ty) {
-                            SpirvType::Pointer { pointee } => pointee,
+                            SpirvType::Pointer { pointee, .. } => pointee,
                             other => self.tcx.dcx().fatal(format!(
                                 "GlobalAlloc::Memory type not implemented: {}",
                                 other.debug(ty, self)
@@ -250,16 +260,21 @@ impl<'tcx> ConstCodegenMethods<'tcx> for CodegenCx<'tcx> {
                         (value, AddressSpace::DATA)
                     }
                     GlobalAlloc::Function { instance } => (
-                        self.get_fn_addr(instance.polymorphize(self.tcx)),
+                        self.get_fn_addr(instance),
                         self.data_layout().instruction_address_space,
                     ),
                     GlobalAlloc::VTable(vty, dyn_ty) => {
                         let alloc = self
                             .tcx
-                            .global_alloc(self.tcx.vtable_allocation((vty, dyn_ty.principal())))
+                            .global_alloc(self.tcx.vtable_allocation((
+                                vty,
+                                dyn_ty.principal().map(|principal| {
+                                    self.tcx.instantiate_bound_regions_with_erased(principal)
+                                }),
+                            )))
                             .unwrap_memory();
                         let pointee = match self.lookup_type(ty) {
-                            SpirvType::Pointer { pointee } => pointee,
+                            SpirvType::Pointer { pointee, .. } => pointee,
                             other => self.tcx.dcx().fatal(format!(
                                 "GlobalAlloc::VTable type not implemented: {}",
                                 other.debug(ty, self)
@@ -301,7 +316,12 @@ impl<'tcx> ConstCodegenMethods<'tcx> for CodegenCx<'tcx> {
     // the actual value generation until after a pointer to this value is cast
     // to its final type (e.g. that will be loaded as).
     // FIXME(eddyb) replace this with `qptr` handling of constant data.
-    fn const_data_from_alloc(&self, alloc: ConstAllocation<'tcx>) -> Self::Value {
+    fn const_data_from_alloc(&self, alloc: ConstAllocation<'_>) -> Self::Value {
+        // HACK(eddyb) the `ConstCodegenMethods` trait no longer guarantees the
+        // lifetime that `alloc` is interned for, but since it *is* interned,
+        // we can cheaply recover it (see also the `ty::Lift` infrastructure).
+        let alloc = self.tcx.lift(alloc).unwrap();
+
         let void_type = SpirvType::Void.def(DUMMY_SP, self);
         self.def_constant(void_type, SpirvConst::ConstDataFromAlloc(alloc))
     }
@@ -323,18 +343,15 @@ impl<'tcx> CodegenCx<'tcx> {
     pub fn const_bitcast(&self, val: SpirvValue, ty: Word) -> SpirvValue {
         // HACK(eddyb) special-case `const_data_from_alloc` + `static_addr_of`
         // as the old `from_const_alloc` (now `OperandRef::from_const_alloc`).
-        if let SpirvValueKind::IllegalConst(_) = val.kind {
-            if let Some(SpirvConst::PtrTo { pointee }) = self.builder.lookup_const(val) {
-                if let Some(SpirvConst::ConstDataFromAlloc(alloc)) =
-                    self.builder.lookup_const_by_id(pointee)
-                {
-                    if let SpirvType::Pointer { pointee } = self.lookup_type(ty) {
-                        let mut offset = Size::ZERO;
-                        let init = self.read_from_const_alloc(alloc, &mut offset, pointee);
-                        return self.static_addr_of(init, alloc.inner().align, None);
-                    }
-                }
-            }
+        if let SpirvValueKind::IllegalConst(_) = val.kind
+            && let Some(SpirvConst::PtrTo { pointee }) = self.builder.lookup_const(val)
+            && let Some(SpirvConst::ConstDataFromAlloc(alloc)) =
+                self.builder.lookup_const_by_id(pointee)
+            && let SpirvType::Pointer { pointee, .. } = self.lookup_type(ty)
+        {
+            let mut offset = Size::ZERO;
+            let init = self.read_from_const_alloc(alloc, &mut offset, pointee);
+            return self.static_addr_of(init, alloc.inner().align, None);
         }
 
         if val.ty == ty {
@@ -363,11 +380,11 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     pub fn create_const_alloc(&self, alloc: ConstAllocation<'tcx>, ty: Word) -> SpirvValue {
-        // println!(
-        //     "Creating const alloc of type {} with {} bytes",
-        //     self.debug_type(ty),
-        //     alloc.inner().len()
-        // );
+        tracing::trace!(
+            "Creating const alloc of type {} with {} bytes",
+            self.debug_type(ty),
+            alloc.inner().len()
+        );
         let mut offset = Size::ZERO;
         let result = self.read_from_const_alloc(alloc, &mut offset, ty);
         assert_eq!(
@@ -375,7 +392,7 @@ impl<'tcx> CodegenCx<'tcx> {
             alloc.inner().len(),
             "create_const_alloc must consume all bytes of an Allocation"
         );
-        // println!("Done creating alloc of type {}", self.debug_type(ty));
+        tracing::trace!("Done creating alloc of type {}", self.debug_type(ty));
         result
     }
 

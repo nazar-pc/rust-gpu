@@ -10,7 +10,7 @@ mod params;
 /// Contains extra image operands
 pub mod sample_with;
 
-pub use self::params::{ImageCoordinate, ImageCoordinateSubpassData, SampleType};
+pub use self::params::{ImageCoordinate, ImageCoordinateSubpassData, ImageSizeQuery, SampleType};
 pub use crate::macros::Image;
 pub use spirv_std_types::image_params::{
     AccessQualifier, Arrayed, Dimensionality, ImageDepth, ImageFormat, Multisampled, Sampled,
@@ -95,7 +95,7 @@ pub type Cubemap = crate::Image!(cube, type=f32, sampled, __crate_root=crate);
 /// You likely want to write this type using the [`crate::Image!`] macro helper, as the generic
 /// arguments here can get extremely verbose.
 ///
-/// See SPIR-V OpTypeImage specification for the meaning of integer parameters.
+/// See SPIR-V `OpTypeImage` specification for the meaning of integer parameters.
 #[spirv(generic_image_type)]
 #[derive(Copy, Clone)]
 // HACK(eddyb) avoids "transparent newtype of `_anti_zst_padding`" misinterpretation.
@@ -149,6 +149,8 @@ impl<
         let mut result = SampledType::Vec4::default();
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%coordinate = OpLoad _ {coordinate}",
                 "%result = OpImageFetch typeof*{result} %image %coordinate",
@@ -200,6 +202,10 @@ impl<
         let mut result = SampledType::Vec4::default();
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%typeSampledImage = OpTypeSampledImage typeof*{this}",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
@@ -230,6 +236,10 @@ impl<
         unsafe {
             let mut result = SampledType::Vec4::default();
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%typeSampledImage = OpTypeSampledImage typeof*{1}",
                 "%image = OpLoad typeof*{1} {1}",
                 "%sampler = OpLoad typeof*{2} {2}",
@@ -262,6 +272,10 @@ impl<
             let mut result = SampledType::Vec4::default();
 
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%typeSampledImage = OpTypeSampledImage typeof*{1}",
                 "%image = OpLoad typeof*{1} {1}",
                 "%sampler = OpLoad typeof*{2} {2}",
@@ -295,6 +309,10 @@ impl<
         let mut result = SampledType::Vec4::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%coordinate = OpLoad _ {coordinate}",
@@ -328,6 +346,10 @@ impl<
         let mut result = SampledType::Vec4::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%coordinate = OpLoad _ {coordinate}",
@@ -362,6 +384,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%coordinate = OpLoad _ {coordinate}",
@@ -395,6 +421,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%coordinate = OpLoad _ {coordinate}",
@@ -432,6 +462,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%coordinate = OpLoad _ {coordinate}",
@@ -487,6 +521,10 @@ impl<
         unsafe {
             let mut result = SampledType::Vec4::default();
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%project_coordinate = OpLoad _ {project_coordinate}",
@@ -517,6 +555,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%project_coordinate = OpLoad _ {project_coordinate}",
@@ -550,6 +592,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%project_coordinate = OpLoad _ {project_coordinate}",
@@ -584,6 +630,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%project_coordinate = OpLoad _ {project_coordinate}",
@@ -617,6 +667,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%coordinate = OpLoad _ {coordinate}",
@@ -654,6 +708,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%coordinate = OpLoad _ {coordinate}",
@@ -710,6 +768,8 @@ impl<
 
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%coordinate = OpLoad _ {coordinate}",
                 "%result = OpImageRead typeof*{result} %image %coordinate",
@@ -733,14 +793,17 @@ impl<
     ) where
         I: Integer,
     {
-        asm! {
-            "%image = OpLoad _ {this}",
-            "%coordinate = OpLoad _ {coordinate}",
-            "%texels = OpLoad _ {texels}",
-            "OpImageWrite %image %coordinate %texels",
-            this = in(reg) self,
-            coordinate = in(reg) &coordinate,
-            texels = in(reg) &texels,
+        unsafe {
+            asm! {
+                "OpDecorate %image NonUniform",
+                "%image = OpLoad _ {this}",
+                "%coordinate = OpLoad _ {coordinate}",
+                "%texels = OpLoad _ {texels}",
+                "OpImageWrite %image %coordinate %texels",
+                this = in(reg) self,
+                coordinate = in(reg) &coordinate,
+                texels = in(reg) &texels,
+            }
         }
     }
 }
@@ -779,6 +842,8 @@ impl<
 
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%coordinate = OpLoad _ {coordinate}",
                 "%result = OpImageRead typeof*{result} %image %coordinate",
@@ -802,14 +867,17 @@ impl<
     ) where
         I: Integer,
     {
-        asm! {
-            "%image = OpLoad _ {this}",
-            "%coordinate = OpLoad _ {coordinate}",
-            "%texels = OpLoad _ {texels}",
-            "OpImageWrite %image %coordinate %texels",
-            this = in(reg) self,
-            coordinate = in(reg) &coordinate,
-            texels = in(reg) &texels,
+        unsafe {
+            asm! {
+                "OpDecorate %image NonUniform",
+                "%image = OpLoad _ {this}",
+                "%coordinate = OpLoad _ {coordinate}",
+                "%texels = OpLoad _ {texels}",
+                "OpImageWrite %image %coordinate %texels",
+                this = in(reg) self,
+                coordinate = in(reg) &coordinate,
+                texels = in(reg) &texels,
+            }
         }
     }
 }
@@ -848,13 +916,15 @@ impl<
 
         unsafe {
             asm! {
-            "%image = OpLoad _ {this}",
-            "%coordinate = OpLoad _ {coordinate}",
-            "%result = OpImageRead typeof*{result} %image %coordinate",
-            "OpStore {result} %result",
-            this = in(reg) self,
-            coordinate = in(reg) &coordinate,
-            result = in(reg) &mut result,
+                "OpDecorate %image NonUniform",
+                "OpDecorate %result NonUniform",
+                "%image = OpLoad _ {this}",
+                "%coordinate = OpLoad _ {coordinate}",
+                "%result = OpImageRead typeof*{result} %image %coordinate",
+                "OpStore {result} %result",
+                this = in(reg) self,
+                coordinate = in(reg) &coordinate,
+                result = in(reg) &mut result,
             }
         }
 
@@ -880,13 +950,16 @@ impl<
     where
         Self: HasQueryLevels,
     {
-        let result: u32;
+        let mut result = Default::default();
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
-                "{result} = OpImageQueryLevels typeof{result} %image",
+                "%result = OpImageQueryLevels typeof*{result} %image",
+                "OpStore {result} %result",
                 this = in(reg) self,
-                result = out(reg) result,
+                result = in(reg) &mut result,
             }
         }
         result
@@ -914,6 +987,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%typeSampledImage = OpTypeSampledImage typeof*{this}",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
@@ -933,13 +1010,15 @@ impl<
     /// Query the dimensions of Image, with no level of detail.
     #[crate::macros::gpu_only]
     #[doc(alias = "OpImageQuerySize")]
-    pub fn query_size<Size: ImageCoordinate<u32, DIM, ARRAYED> + Default>(&self) -> Size
+    pub fn query_size<Size: ImageSizeQuery<u32, DIM, ARRAYED> + Default>(&self) -> Size
     where
         Self: HasQuerySize,
     {
         let mut result: Size = Default::default();
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%result = OpImageQuerySize typeof*{result} %image",
                 "OpStore {result} %result",
@@ -971,10 +1050,10 @@ impl<
         COMPONENTS,
     >
 {
-    /// Query the dimensions of Image, with no level of detail.
+    /// Query the dimensions of Image at a specific level of detail.
     #[crate::macros::gpu_only]
     #[doc(alias = "OpImageQuerySizeLod")]
-    pub fn query_size_lod<Size: ImageCoordinate<u32, DIM, ARRAYED> + Default>(
+    pub fn query_size_lod<Size: ImageSizeQuery<u32, DIM, ARRAYED> + Default>(
         &self,
         lod: u32,
     ) -> Size
@@ -984,6 +1063,8 @@ impl<
         let mut result: Size = Default::default();
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%result = OpImageQuerySizeLod typeof*{result} %image {lod}",
                 "OpStore {result} %result",
@@ -1019,13 +1100,16 @@ impl<
     #[crate::macros::gpu_only]
     #[doc(alias = "OpImageQuerySamples")]
     pub fn query_samples(&self) -> u32 {
-        let result: u32;
+        let mut result = Default::default();
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
-                "{result} = OpImageQuerySamples typeof{result} %image",
+                "%result = OpImageQuerySamples typeof*{result} %image",
+                "OpStore {result} %result",
                 this = in(reg) self,
-                result = out(reg) result,
+                result = in(reg) &mut result,
             }
         }
         result
@@ -1079,6 +1163,8 @@ impl<
         let mut result = SampledType::Vec4::default();
         unsafe {
             asm!(
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%sampledImage = OpLoad typeof*{1} {1}",
                 "%coord = OpLoad typeof*{2} {2}",
                 "%result = OpImageSampleImplicitLod typeof*{0} %sampledImage %coord",
@@ -1104,6 +1190,8 @@ impl<
         let mut result = SampledType::Vec4::default();
         unsafe {
             asm!(
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%sampledImage = OpLoad typeof*{1} {1}",
                 "%coord = OpLoad typeof*{2} {2}",
                 "%lod = OpLoad typeof*{3} {3}",
@@ -1116,6 +1204,94 @@ impl<
             );
         }
         result.truncate_into()
+    }
+
+    /// Query the dimensions of the image at the specified level of detail.
+    #[crate::macros::gpu_only]
+    #[doc(alias = "OpImageQuerySizeLod")]
+    pub fn query_size_lod<Size: ImageSizeQuery<u32, DIM, ARRAYED> + Default>(
+        &self,
+        lod: u32,
+    ) -> Size
+    where
+        Image<
+            SampledType,
+            DIM,
+            DEPTH,
+            ARRAYED,
+            { Multisampled::False as u32 },
+            SAMPLED,
+            FORMAT,
+            COMPONENTS,
+        >: HasQuerySizeLod,
+    {
+        let mut result: Size = Default::default();
+        unsafe {
+            asm! {
+                "%sampledImage = OpLoad _ {this}",
+                "%image = OpImage _ %sampledImage",
+                "%result = OpImageQuerySizeLod typeof*{result} %image {lod}",
+                "OpStore {result} %result",
+                this = in(reg) self,
+                lod = in(reg) lod,
+                result = in(reg) &mut result,
+            }
+        }
+        result
+    }
+}
+
+impl<
+    SampledType: SampleType<FORMAT, COMPONENTS>,
+    const DIM: u32,
+    const DEPTH: u32,
+    const ARRAYED: u32,
+    const SAMPLED: u32,
+    const FORMAT: u32,
+    const COMPONENTS: u32,
+>
+    SampledImage<
+        Image<
+            SampledType,
+            DIM,
+            DEPTH,
+            ARRAYED,
+            { Multisampled::True as u32 },
+            SAMPLED,
+            FORMAT,
+            COMPONENTS,
+        >,
+    >
+{
+    /// Query the dimensions of the image, with no level of detail.
+    /// Available only for multisampled images.
+    #[crate::macros::gpu_only]
+    #[doc(alias = "OpImageQuerySize")]
+    pub fn query_size<Size: ImageSizeQuery<u32, DIM, ARRAYED> + Default>(&self) -> Size
+    where
+        Image<
+            SampledType,
+            DIM,
+            DEPTH,
+            ARRAYED,
+            { Multisampled::True as u32 },
+            SAMPLED,
+            FORMAT,
+            COMPONENTS,
+        >: HasQuerySize,
+    {
+        let mut result: Size = Default::default();
+        unsafe {
+            asm! {
+                "%sampledImage = OpLoad _ {this}",
+                "%image = OpImage _ %sampledImage",
+                "%result = OpImageQuerySize typeof*{result} %image",
+                "OpStore {result} %result",
+                this = in(reg) self,
+                result = in(reg) &mut result,
+            }
+        }
+        result
     }
 }
 
@@ -1238,6 +1414,8 @@ impl<
         let mut result = SampledType::Vec4::default();
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%coordinate = OpLoad _ {coordinate}",
                 "%result = OpImageFetch typeof*{result} %image %coordinate $PARAMS",
@@ -1268,6 +1446,10 @@ impl<
         let mut result = SampledType::Vec4::default();
         unsafe {
             asm! {
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%typeSampledImage = OpTypeSampledImage typeof*{this}",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
@@ -1299,6 +1481,10 @@ impl<
         unsafe {
             let mut result = SampledType::Vec4::default();
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%typeSampledImage = OpTypeSampledImage typeof*{this}",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
@@ -1331,6 +1517,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%coordinate = OpLoad _ {coordinate}",
@@ -1363,6 +1553,10 @@ impl<
         unsafe {
             let mut result = SampledType::Vec4::default();
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%project_coordinate = OpLoad _ {project_coordinate}",
@@ -1394,6 +1588,10 @@ impl<
         let mut result = Default::default();
         unsafe {
             asm!(
+                "OpDecorate %image NonUniform",
+                "OpDecorate %sampler NonUniform",
+                "OpDecorate %sampledImage NonUniform",
+                "OpDecorate %result NonUniform",
                 "%image = OpLoad _ {this}",
                 "%sampler = OpLoad _ {sampler}",
                 "%project_coordinate = OpLoad _ {project_coordinate}",

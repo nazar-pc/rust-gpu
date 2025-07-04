@@ -17,71 +17,52 @@ jobs:
     name: Test
     strategy:
       matrix:
-        include:
-          - os: ubuntu-20.04
-            target: x86_64-unknown-linux-gnu
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-          - os: macOS-latest
-            target: x86_64-apple-darwin
-          - os: ubuntu-20.04
-            target: aarch64-linux-android
-            host: x86_64-unknown-linux-gnu
+        os: [ ubuntu-24.04, windows-2022, macOS-latest ]
     runs-on: ${{ matrix.os }}
     env:
       RUSTUP_UNPACK_RAM: "26214400"
       RUSTUP_IO_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
-      # Install the spirv-tools binaries from tarballs hosted on each release
-      # of spirv-tools. This downloads the tarball, decompresses it, unpacks
-      # the binaries to the specified path, and adds them to PATH
-      - name: Install spirv-tools binaries
-        shell: bash
-        run: cargo run --manifest-path .github/install-spirv-tools/Cargo.toml -- ${{matrix.host || matrix.target}} 0.10.0 "${{github.workspace}}/bin"
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
       - if: ${{ runner.os == 'Linux' }}
         name: Linux - Install native dependencies
         run: sudo apt install libwayland-cursor0 libxkbcommon-dev libwayland-dev
-      # cargo version is a random command that forces the installation of rust-toolchain
+      # just need a random command that forces the installation of rust-toolchain
+      # figure out native target triple while we're at it
       - name: install rust-toolchain
-        run: cargo version
+        run: echo "TARGET=$(rustc --print host-tuple)" >> "$GITHUB_ENV"
       # Fetch dependencies in a separate step to clearly show how long each part
       # of the testing takes
       - name: cargo fetch --locked
-        run: cargo fetch --locked --target ${{ matrix.target }}
+        run: cargo fetch --locked --target $TARGET
 
       # Core crates
       # Compiled in --release because cargo compiletest would otherwise compile in release again.
       - name: rustc_codegen_spirv build
-        if: ${{ matrix.target != 'aarch64-linux-android' }}
         run: cargo test -p rustc_codegen_spirv --release --no-default-features --features "use-installed-tools" --no-run
 
       - name: rustc_codegen_spirv test
-        if: ${{ matrix.target != 'aarch64-linux-android' }}
         run: cargo test -p rustc_codegen_spirv --release --no-default-features --features "use-installed-tools"
 
-      - name: compiletest
-        if: ${{ matrix.target != 'aarch64-linux-android' }}
-        run: cargo run -p compiletests --release --no-default-features --features "use-installed-tools" -- --target-env vulkan1.1,vulkan1.2,spv1.3
-
-      - name: workspace test
-        if: ${{ matrix.target != 'aarch64-linux-android' }}
-        run: cargo test --release
+      - name: workspace test (excluding examples & difftest)
+        run: cargo test --release --workspace --exclude "example-runner-*" --exclude "difftest*" --no-default-features --features "use-installed-tools"
 
       # Examples
       - name: cargo check examples
-        if: ${{ matrix.target != 'aarch64-linux-android' }}
         run: cargo check -p example-runner-ash -p example-runner-wgpu -p example-runner-cpu -p compute-shader -p mouse-shader -p simplest-shader -p sky-shader --no-default-features --features "use-installed-tools"
 
       - name: build example shaders
-        if: ${{ matrix.target != 'aarch64-linux-android' }}
         env:
           PROFILE: release
           OUT_DIR: "target/release/ci/out"
         run: cargo run -p example-runner-wgpu-builder --release --no-default-features --features "use-installed-tools"
 
       - name: build example shaders (dev aka "debug mode")
-        if: ${{ matrix.target != 'aarch64-linux-android' }}
         env:
           # HACK(eddyb) see `[profile.dev]` in `Cargo.toml` for more on why
           # `-Zshare-generics=off` is useful (and why it had to be moved here).
@@ -90,8 +71,29 @@ jobs:
           OUT_DIR: "target/debug/ci/out"
         run: cargo run -p example-runner-wgpu-builder --no-default-features --features "use-installed-tools"
 
+  android:
+    name: Android
+    strategy:
+      matrix:
+        os: [ ubuntu-24.04 ]
+        target: [ aarch64-linux-android ]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_UNPACK_RAM: "26214400"
+      RUSTUP_IO_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+      - name: install rust-toolchain
+        run: cargo version
+      - name: cargo fetch --locked
+        run: cargo fetch --locked --target ${{ matrix.target }}
+
       - name: Build WGPU Example for Android
-        if: ${{ matrix.target == 'aarch64-linux-android' }}
         shell: bash
         run: |
           echo "::group::Uninstall android-31"
@@ -114,17 +116,79 @@ jobs:
           cargo apk build -p example-runner-wgpu --lib --features use-installed-tools --no-default-features
           echo "::endgroup::"
 
-  # This just allows us to branch protect on this one job rather needing to change
-  # it if the test matrix changes
-  test_success:
-    runs-on: ubuntu-22.04
-    needs: test
+  compiletest:
+    name: Compiletest
+    strategy:
+      matrix:
+        os: [ ubuntu-24.04, windows-2022, macOS-latest ]
+    runs-on: ${{ matrix.os }}
     steps:
-    - run: echo "All test jobs passed"
+      - uses: actions/checkout@v4
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+      - name: install rust-toolchain
+        run: echo "TARGET=$(rustc --print host-tuple)" >> "$GITHUB_ENV"
+      - name: cargo fetch --locked
+        run: cargo fetch --locked --target $TARGET
+      - name: compiletest
+        run: cargo run -p compiletests --release --no-default-features --features "use-installed-tools" -- --target-env vulkan1.1,vulkan1.2,vulkan1.3,vulkan1.4,spv1.3
+
+  difftest:
+    name: Difftest
+    strategy:
+      matrix:
+        os: [ ubuntu-24.04, windows-2022, macOS-latest ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+      - if: ${{ runner.os == 'Linux' }}
+        name: Linux - Install native dependencies
+        run: sudo apt install libwayland-cursor0 libxkbcommon-dev libwayland-dev
+      - if: ${{ runner.os == 'Linux' }}
+        name: Install xvfb, llvmpipe and lavapipe
+        run: |
+          sudo apt-get update -y -qq
+          sudo add-apt-repository ppa:kisak/turtle -y
+          sudo apt-get update
+          sudo apt install -y xvfb libgl1-mesa-dri libxcb-xfixes0-dev mesa-vulkan-drivers
+      - name: install rust-toolchain
+        run: echo "TARGET=$(rustc --print host-tuple)" >> "$GITHUB_ENV"
+      - name: cargo fetch --locked
+        run: cargo fetch --locked --target $TARGET
+      - name: cargo fetch --locked difftests
+        run: cargo fetch --locked --manifest-path=tests/difftests/tests/Cargo.toml --target $TARGET
+      - name: test difftest
+        run: cargo test -p "difftest*" --release --no-default-features --features "use-installed-tools"
+      - name: difftests
+        run: cargo run -p difftests --release --no-default-features --features "use-installed-tools"
+
+  # This allows us to have a single job we can branch protect on, rather than needing
+  # to update the branch protection rules when the test matrix changes
+  test_success:
+    runs-on: ubuntu-24.04
+    needs: [test, compiletest, difftest, android]
+    # Hack for buggy GitHub Actions behavior with skipped checks: https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks#handling-skipped-but-required-checks
+    if: ${{ always() }}
+    steps:
+      # Another hack is to actually check the status of the dependencies or else it'll fall through
+      - run: |
+          echo "Checking statuses..."
+          [[ "${{ needs.test.result }}" == "success" ]] || exit 1
+          [[ "${{ needs.compiletest.result }}" == "success" ]] || exit 1
+          [[ "${{ needs.difftest.result }}" == "success" ]] || exit 1
+          [[ "${{ needs.android.result }}" == "success" ]] || exit 1
 
   lint:
     name: Lint
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       # Note that we are explicitly NOT checking out submodules, to validate
       # that we haven't accidentally enabled spirv-tools native compilation
@@ -134,8 +198,11 @@ jobs:
           submodules: "false"
       - name: Install native dependencies
         run: sudo apt install libwayland-cursor0 libxkbcommon-dev libwayland-dev
-      - name: Install spirv-tools
-        run: cargo run --manifest-path .github/install-spirv-tools/Cargo.toml -- x86_64-unknown-linux-gnu 0.10.0 "${{github.workspace}}/bin"
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
       - name: Install rustup components
         run: rustup component add rustfmt clippy
       # cargo version is a random command that forces the installation of rust-toolchain
@@ -145,8 +212,10 @@ jobs:
         run: cargo fetch --locked
       - name: Rustfmt
         run: cargo fmt --all -- --check
-      - name: Rustfmt tests
-        run: rustfmt --check tests/ui/**/*.rs
+      - name: Rustfmt compiletests
+        run: shopt -s globstar && rustfmt --check tests/compiletests/ui/**/*.rs
+      - name: Rustfmt difftests
+        run: cargo fmt --check --all --manifest-path tests/difftests/tests/Cargo.toml
       - name: Check docs are valid
         run: RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps
       - name: Check docs for `spirv-std` and `spirv-builder` on stable (for docs.rs)
@@ -157,7 +226,11 @@ jobs:
         run: .github/workflows/lint.sh
 
   cargo-deny:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+defaults:
+  run:
+    shell: bash

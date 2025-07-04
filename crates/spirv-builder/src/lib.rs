@@ -36,7 +36,6 @@
     clippy::map_err_ignore,
     clippy::map_flatten,
     clippy::map_unwrap_or,
-    clippy::match_on_vec_items,
     clippy::match_same_arms,
     clippy::match_wildcard_for_single_variants,
     clippy::mem_forget,
@@ -72,116 +71,74 @@
 // #![allow()]
 #![doc = include_str!("../README.md")]
 
-// HACK(eddyb) try to catch misuse of Cargo package features very early on
-// (see `spirv-builder/Cargo.toml` for why we go through all of this).
-#[cfg(all(
-    not(any(feature = "use-compiled-tools", feature = "use-installed-tools")),
-    not(doc)
-))]
-compile_error!(
-    "at least one of `use-compiled-tools` or `use-installed-tools` features must be enabled
-(outside of documentation builds, which require disabling both to build on stable)"
-);
-
-#[cfg(doc)]
-fn _ensure_cfg_doc_means_rustdoc() {
-    // HACK(eddyb) this relies on specific `rustdoc` behavior (i.e. it skips
-    // type-checking function bodies, so we trigger a compile-time `panic! from
-    // a type) to check that we're in fact under `rustdoc`, not just `--cfg doc`.
-    #[rustfmt::skip]
-    let _: [(); panic!("
-
-            `--cfg doc` was set outside of `rustdoc`
-            (if you are running `rustdoc` or `cargo doc`, please file an issue)
-
-")];
-}
-
 mod depfile;
 #[cfg(feature = "watch")]
 mod watch;
 
 use raw_string::{RawStr, RawString};
+use semver::Version;
 use serde::Deserialize;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::env;
-use std::error::Error;
-use std::fmt;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use thiserror::Error;
 
 pub use rustc_codegen_spirv_types::Capability;
 pub use rustc_codegen_spirv_types::{CompileResult, ModuleResult};
 
-#[derive(Debug)]
+#[cfg(feature = "include-target-specs")]
+pub use rustc_codegen_spirv_target_specs::TARGET_SPEC_DIR_PATH;
+
+#[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SpirvBuilderError {
+    #[error("`target` must be set, for example `spirv-unknown-vulkan1.2`")]
+    MissingTarget,
+    #[error("expected `{SPIRV_TARGET_PREFIX}...` target, found `{target}`")]
     NonSpirvTarget { target: String },
+    #[error("SPIR-V target `{SPIRV_TARGET_PREFIX}-{target_env}` is not supported")]
     UnsupportedSpirvTargetEnv { target_env: String },
+    #[error("`path_to_crate` must be set")]
+    MissingCratePath,
+    #[error("crate path '{0}' does not exist")]
     CratePathDoesntExist(PathBuf),
+    #[error(
+        "Without feature `rustc_codegen_spirv`, you need to set the path of the dylib with `rustc_codegen_spirv_location`"
+    )]
+    MissingRustcCodegenSpirvDylib,
+    #[error("`rustc_codegen_spirv_location` path '{0}' is not a file")]
+    RustcCodegenSpirvDylibDoesNotExist(PathBuf),
+    #[error(
+        "Without feature `include-target-specs`, instead of setting a `target`, \
+        you need to set the path of the target spec file of your particular target with `path_to_target_spec`"
+    )]
+    MissingTargetSpec,
+    #[error("build failed")]
     BuildFailed,
+    #[error("multi-module build cannot be used with print_metadata = MetadataPrintout::Full")]
     MultiModuleWithPrintMetadata,
+    #[error("watching within build scripts will prevent build completion")]
     WatchWithPrintMetadata,
-    MetadataFileMissing(std::io::Error),
-    MetadataFileMalformed(serde_json::Error),
+    #[error("multi-module metadata file missing")]
+    MetadataFileMissing(#[from] std::io::Error),
+    #[error("unable to parse multi-module metadata file")]
+    MetadataFileMalformed(#[from] serde_json::Error),
+    #[error("cargo metadata error")]
+    CargoMetadata(#[from] cargo_metadata::Error),
 }
 
 const SPIRV_TARGET_PREFIX: &str = "spirv-unknown-";
 
-impl fmt::Display for SpirvBuilderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NonSpirvTarget { target } => {
-                write!(
-                    f,
-                    "expected `{SPIRV_TARGET_PREFIX}...` target, found `{target}`"
-                )
-            }
-            Self::UnsupportedSpirvTargetEnv { target_env } if target_env.starts_with("opencl") => {
-                write!(
-                    f,
-                    "OpenCL targets like `{SPIRV_TARGET_PREFIX}-{target_env}` are not supported"
-                )
-            }
-            Self::UnsupportedSpirvTargetEnv { target_env } if target_env.starts_with("webgpu") => {
-                write!(
-                    f,
-                    "WebGPU targets like `{SPIRV_TARGET_PREFIX}-{target_env}` are not supported, \
-                     consider using `{SPIRV_TARGET_PREFIX}-vulkan1.0` instead"
-                )
-            }
-            Self::UnsupportedSpirvTargetEnv { target_env } => {
-                write!(
-                    f,
-                    "SPIR-V target `{SPIRV_TARGET_PREFIX}-{target_env}` is not supported"
-                )
-            }
-            Self::CratePathDoesntExist(path) => {
-                write!(f, "crate path {} does not exist", path.display())
-            }
-            Self::BuildFailed => f.write_str("build failed"),
-            Self::MultiModuleWithPrintMetadata => f.write_str(
-                "multi-module build cannot be used with print_metadata = MetadataPrintout::Full",
-            ),
-            Self::WatchWithPrintMetadata => {
-                f.write_str("watching within build scripts will prevent build completion")
-            }
-            Self::MetadataFileMissing(_) => f.write_str("multi-module metadata file missing"),
-            Self::MetadataFileMalformed(_) => {
-                f.write_str("unable to parse multi-module metadata file")
-            }
-        }
-    }
-}
-
-impl Error for SpirvBuilderError {}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[non_exhaustive]
 pub enum MetadataPrintout {
     /// Print no cargo metadata.
+    #[default]
     None,
     /// Print only dependency information (eg for multiple modules).
     DependencyOnly,
@@ -191,9 +148,12 @@ pub enum MetadataPrintout {
     Full,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[non_exhaustive]
 pub enum SpirvMetadata {
     /// Strip all names and other debug information from SPIR-V output.
+    #[default]
     None,
     /// Only include `OpName`s for public interface variables (uniforms and the like), to allow
     /// shader reflection.
@@ -203,13 +163,16 @@ pub enum SpirvMetadata {
 }
 
 /// Strategy used to handle Rust `panic!`s in shaders compiled to SPIR-V.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[non_exhaustive]
 pub enum ShaderPanicStrategy {
     /// Return from shader entry-point with no side-effects **(default)**.
     ///
     /// While similar to the standard SPIR-V `OpTerminateInvocation`, this is
     /// *not* limited to fragment shaders, and instead supports all shaders
     /// (as it's handled via control-flow rewriting, instead of SPIR-V features).
+    #[default]
     SilentExit,
 
     /// Like `SilentExit`, but also using `debugPrintf` to report the panic in
@@ -255,6 +218,7 @@ pub enum ShaderPanicStrategy {
     ///     their `debugPrintf` support can be done during instance creation
     ///   * *optional*: integrating [`VK_EXT_debug_utils`](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_EXT_debug_utils.html)
     ///     allows more reporting flexibility than `DEBUG_PRINTF_TO_STDOUT=1`)
+    #[cfg_attr(feature = "clap", clap(skip))]
     DebugPrintfThenExit {
         /// Whether to also print the entry-point inputs (excluding buffers/resources),
         /// which should uniquely identify the panicking shader invocation.
@@ -283,72 +247,253 @@ pub enum ShaderPanicStrategy {
     UNSOUND_DO_NOT_USE_UndefinedBehaviorViaUnreachable,
 }
 
-/// Cargo features specification for building the shader crate.
-#[derive(Default)]
-struct ShaderCrateFeatures {
-    default_features: Option<bool>,
-    features: Vec<String>,
+/// Options for specifying the behavior of the validator
+/// Copied from `spirv-tools/src/val.rs` struct `ValidatorOptions`, with some fields disabled.
+#[derive(Default, Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "clap", derive(clap::Parser))]
+#[non_exhaustive]
+pub struct ValidatorOptions {
+    /// Record whether or not the validator should relax the rules on types for
+    /// stores to structs.  When relaxed, it will allow a type mismatch as long as
+    /// the types are structs with the same layout.  Two structs have the same layout
+    /// if
+    ///
+    /// 1) the members of the structs are either the same type or are structs with
+    ///    same layout, and
+    ///
+    /// 2) the decorations that affect the memory layout are identical for both
+    ///    types.  Other decorations are not relevant.
+    #[cfg_attr(feature = "clap", arg(long, default_value = "false"))]
+    pub relax_struct_store: bool,
+    /// Records whether or not the validator should relax the rules on pointer usage
+    /// in logical addressing mode.
+    ///
+    /// When relaxed, it will allow the following usage cases of pointers:
+    /// 1) `OpVariable` allocating an object whose type is a pointer type
+    /// 2) `OpReturnValue` returning a pointer value
+    #[cfg_attr(feature = "clap", arg(long, default_value = "false"))]
+    pub relax_logical_pointer: bool,
+    // /// Records whether or not the validator should relax the rules because it is
+    // /// expected that the optimizations will make the code legal.
+    // ///
+    // /// When relaxed, it will allow the following:
+    // /// 1) It will allow relaxed logical pointers.  Setting this option will also
+    // ///    set that option.
+    // /// 2) Pointers that are pass as parameters to function calls do not have to
+    // ///    match the storage class of the formal parameter.
+    // /// 3) Pointers that are actaul parameters on function calls do not have to point
+    // ///    to the same type pointed as the formal parameter.  The types just need to
+    // ///    logically match.
+    // pub before_legalization: bool,
+    /// Records whether the validator should use "relaxed" block layout rules.
+    /// Relaxed layout rules are described by Vulkan extension
+    /// `VK_KHR_relaxed_block_layout`, and they affect uniform blocks, storage blocks,
+    /// and push constants.
+    ///
+    /// This is enabled by default when targeting Vulkan 1.1 or later.
+    /// Relaxed layout is more permissive than the default rules in Vulkan 1.0.
+    #[cfg_attr(feature = "clap", arg(long, default_value = "false"))]
+    pub relax_block_layout: Option<bool>,
+    /// Records whether the validator should use standard block layout rules for
+    /// uniform blocks.
+    #[cfg_attr(feature = "clap", arg(long, default_value = "false"))]
+    pub uniform_buffer_standard_layout: bool,
+    /// Records whether the validator should use "scalar" block layout rules.
+    /// Scalar layout rules are more permissive than relaxed block layout.
+    ///
+    /// See Vulkan extnesion `VK_EXT_scalar_block_layout`.  The scalar alignment is
+    /// defined as follows:
+    /// - scalar alignment of a scalar is the scalar size
+    /// - scalar alignment of a vector is the scalar alignment of its component
+    /// - scalar alignment of a matrix is the scalar alignment of its component
+    /// - scalar alignment of an array is the scalar alignment of its element
+    /// - scalar alignment of a struct is the max scalar alignment among its
+    ///   members
+    ///
+    /// For a struct in Uniform, `StorageClass`, or `PushConstant`:
+    /// - a member Offset must be a multiple of the member's scalar alignment
+    /// - `ArrayStride` or `MatrixStride` must be a multiple of the array or matrix
+    ///   scalar alignment
+    #[cfg_attr(feature = "clap", arg(long, default_value = "false"))]
+    pub scalar_block_layout: bool,
+    /// Records whether or not the validator should skip validating standard
+    /// uniform/storage block layout.
+    #[cfg_attr(feature = "clap", arg(long, default_value = "false"))]
+    pub skip_block_layout: bool,
+    // /// Applies a maximum to one or more Universal limits
+    // pub max_limits: Vec<(ValidatorLimits, u32)>,
 }
 
+/// Options for specifying the behavior of the optimizer
+/// Copied from `spirv-tools/src/opt.rs` struct `Options`, with some fields disabled.
+#[derive(Default, Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "clap", derive(clap::Parser))]
+#[non_exhaustive]
+pub struct OptimizerOptions {
+    // /// Records the validator options that should be passed to the validator,
+    // /// the validator will run with the options before optimizer.
+    // pub validator_options: Option<crate::val::ValidatorOptions>,
+    // /// Records the maximum possible value for the id bound.
+    // pub max_id_bound: Option<u32>,
+    /// Records whether all bindings within the module should be preserved.
+    #[cfg_attr(feature = "clap", arg(long, default_value = "false"))]
+    pub preserve_bindings: bool,
+    // /// Records whether all specialization constants within the module
+    // /// should be preserved.
+    // pub preserve_spec_constants: bool,
+}
+
+/// Cargo features specification for building the shader crate.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "clap", derive(clap::Parser))]
+#[non_exhaustive]
+pub struct ShaderCrateFeatures {
+    /// Set --default-features for the target shader crate.
+    #[cfg_attr(feature = "clap", clap(long = "no-default-features", default_value = "true", action = clap::ArgAction::SetFalse))]
+    pub default_features: bool,
+    /// Set --features for the target shader crate.
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub features: Vec<String>,
+}
+
+impl Default for ShaderCrateFeatures {
+    fn default() -> Self {
+        Self {
+            default_features: true,
+            features: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "clap", derive(clap::Parser))]
+#[non_exhaustive]
 pub struct SpirvBuilder {
-    path_to_crate: PathBuf,
-    print_metadata: MetadataPrintout,
-    release: bool,
-    target: String,
-    shader_crate_features: ShaderCrateFeatures,
-    deny_warnings: bool,
-    multimodule: bool,
-    spirv_metadata: SpirvMetadata,
-    capabilities: Vec<Capability>,
-    extensions: Vec<String>,
-    extra_args: Vec<String>,
-    // Optional location of a known `rustc_codegen_spirv` dylib
-    rustc_codegen_spirv_location: Option<std::path::PathBuf>,
-    // Optional location of a known "target-spec" file
-    path_to_target_spec: Option<PathBuf>,
+    #[cfg_attr(feature = "clap", clap(skip))]
+    pub path_to_crate: Option<PathBuf>,
+    /// Whether to print build.rs cargo metadata (e.g. cargo:rustc-env=var=val). Defaults to [`MetadataPrintout::None`].
+    /// Within build scripts, set it to [`MetadataPrintout::DependencyOnly`] or [`MetadataPrintout::Full`] to ensure the build script is rerun on code changes.
+    #[cfg_attr(feature = "clap", clap(skip))]
+    pub print_metadata: MetadataPrintout,
+    /// Build in release. Defaults to true.
+    #[cfg_attr(feature = "clap", clap(long = "debug", default_value = "true", action = clap::ArgAction::SetFalse))]
+    pub release: bool,
+    /// The target triple, eg. `spirv-unknown-vulkan1.2`
+    #[cfg_attr(
+        feature = "clap",
+        clap(long, default_value = "spirv-unknown-vulkan1.2")
+    )]
+    pub target: Option<String>,
+    /// Cargo features specification for building the shader crate.
+    #[cfg_attr(feature = "clap", clap(flatten))]
+    #[serde(flatten)]
+    pub shader_crate_features: ShaderCrateFeatures,
+    /// Deny any warnings, as they may never be printed when building within a build script. Defaults to false.
+    #[cfg_attr(feature = "clap", arg(long, default_value = "false"))]
+    pub deny_warnings: bool,
+    /// Splits the resulting SPIR-V file into one module per entry point. This is useful in cases
+    /// where ecosystem tooling has bugs around multiple entry points per module - having all entry
+    /// points bundled into a single file is the preferred system.
+    #[cfg_attr(feature = "clap", arg(long, default_value = "false"))]
+    pub multimodule: bool,
+    /// Sets the level of metadata (primarily `OpName` and `OpLine`) included in the SPIR-V binary.
+    /// Including metadata significantly increases binary size.
+    #[cfg_attr(feature = "clap", arg(long, default_value = "none"))]
+    pub spirv_metadata: SpirvMetadata,
+    /// Adds a capability to the SPIR-V module. Checking if a capability is enabled in code can be
+    /// done via `#[cfg(target_feature = "TheCapability")]`.
+    #[cfg_attr(feature = "clap", arg(long, value_parser=Self::parse_spirv_capability))]
+    pub capabilities: Vec<Capability>,
+    /// Adds an extension to the SPIR-V module. Checking if an extension is enabled in code can be
+    /// done via `#[cfg(target_feature = "ext:the_extension")]`.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub extensions: Vec<String>,
+    /// Set additional "codegen arg". Note: the `RUSTGPU_CODEGEN_ARGS` environment variable
+    /// takes precedence over any set arguments using this function.
+    #[cfg_attr(feature = "clap", clap(skip))]
+    pub extra_args: Vec<String>,
+    // Location of a known `rustc_codegen_spirv` dylib, only required without feature `rustc_codegen_spirv`.
+    #[cfg_attr(feature = "clap", clap(skip))]
+    pub rustc_codegen_spirv_location: Option<PathBuf>,
+    // Overwrite the toolchain like `cargo +nightly`
+    #[cfg_attr(feature = "clap", clap(skip))]
+    pub toolchain_overwrite: Option<String>,
+    // Set the rustc version of the toolchain, used to adjust params to support older toolchains
+    #[cfg_attr(feature = "clap", clap(skip))]
+    pub toolchain_rustc_version: Option<Version>,
+
+    /// The path of the "target specification" file.
+    ///
+    /// For more info on "target specification" see
+    /// [this RFC](https://rust-lang.github.io/rfcs/0131-target-specification.html).
+    #[cfg_attr(feature = "clap", clap(skip))]
+    pub path_to_target_spec: Option<PathBuf>,
+    /// Set the target dir path to use for building shaders. Relative paths will be resolved
+    /// relative to the `target` dir of the shader crate, absolute paths are used as is.
+    /// Defaults to `spirv-builder`, resulting in the path `./target/spirv-builder`.
+    #[cfg_attr(feature = "clap", clap(skip))]
+    pub target_dir_path: Option<PathBuf>,
 
     // `rustc_codegen_spirv::linker` codegen args
+    /// Change the shader `panic!` handling strategy (see [`ShaderPanicStrategy`]).
+    #[cfg_attr(feature = "clap", clap(skip))]
     pub shader_panic_strategy: ShaderPanicStrategy,
 
-    // spirv-val flags
-    pub relax_struct_store: bool,
-    pub relax_logical_pointer: bool,
-    pub relax_block_layout: bool,
-    pub uniform_buffer_standard_layout: bool,
-    pub scalar_block_layout: bool,
-    pub skip_block_layout: bool,
+    /// spirv-val flags
+    #[cfg_attr(feature = "clap", clap(flatten))]
+    #[serde(flatten)]
+    pub validator: ValidatorOptions,
 
-    // spirv-opt flags
-    pub preserve_bindings: bool,
+    /// spirv-opt flags
+    #[cfg_attr(feature = "clap", clap(flatten))]
+    #[serde(flatten)]
+    pub optimizer: OptimizerOptions,
 }
 
+#[cfg(feature = "clap")]
 impl SpirvBuilder {
-    pub fn new(path_to_crate: impl AsRef<Path>, target: impl Into<String>) -> Self {
+    /// Clap value parser for `Capability`.
+    fn parse_spirv_capability(capability: &str) -> Result<Capability, clap::Error> {
+        use core::str::FromStr;
+        Capability::from_str(capability).map_or_else(
+            |()| Err(clap::Error::new(clap::error::ErrorKind::InvalidValue)),
+            Ok,
+        )
+    }
+}
+
+impl Default for SpirvBuilder {
+    fn default() -> Self {
         Self {
-            path_to_crate: path_to_crate.as_ref().to_owned(),
-            print_metadata: MetadataPrintout::Full,
+            path_to_crate: None,
+            print_metadata: MetadataPrintout::default(),
             release: true,
-            target: target.into(),
+            target: None,
             deny_warnings: false,
             multimodule: false,
-            spirv_metadata: SpirvMetadata::None,
+            spirv_metadata: SpirvMetadata::default(),
             capabilities: Vec::new(),
             extensions: Vec::new(),
             extra_args: Vec::new(),
             rustc_codegen_spirv_location: None,
             path_to_target_spec: None,
-
-            shader_panic_strategy: ShaderPanicStrategy::SilentExit,
-
-            relax_struct_store: false,
-            relax_logical_pointer: false,
-            relax_block_layout: false,
-            uniform_buffer_standard_layout: false,
-            scalar_block_layout: false,
-            skip_block_layout: false,
-
-            preserve_bindings: false,
+            target_dir_path: None,
+            toolchain_overwrite: None,
+            toolchain_rustc_version: None,
+            shader_panic_strategy: ShaderPanicStrategy::default(),
+            validator: ValidatorOptions::default(),
+            optimizer: OptimizerOptions::default(),
             shader_crate_features: ShaderCrateFeatures::default(),
+        }
+    }
+}
+
+impl SpirvBuilder {
+    pub fn new(path_to_crate: impl AsRef<Path>, target: impl Into<String>) -> Self {
+        Self {
+            path_to_crate: Some(path_to_crate.as_ref().to_owned()),
+            target: Some(target.into()),
+            ..SpirvBuilder::default()
         }
     }
 
@@ -425,7 +570,7 @@ impl SpirvBuilder {
     /// Allow store from one struct type to a different type with compatible layout and members.
     #[must_use]
     pub fn relax_struct_store(mut self, v: bool) -> Self {
-        self.relax_struct_store = v;
+        self.validator.relax_struct_store = v;
         self
     }
 
@@ -433,7 +578,7 @@ impl SpirvBuilder {
     /// in logical addressing mode
     #[must_use]
     pub fn relax_logical_pointer(mut self, v: bool) -> Self {
-        self.relax_logical_pointer = v;
+        self.validator.relax_logical_pointer = v;
         self
     }
 
@@ -441,7 +586,7 @@ impl SpirvBuilder {
     /// push constant layouts. This is the default when targeting Vulkan 1.1 or later.
     #[must_use]
     pub fn relax_block_layout(mut self, v: bool) -> Self {
-        self.relax_block_layout = v;
+        self.validator.relax_block_layout = Some(v);
         self
     }
 
@@ -449,7 +594,7 @@ impl SpirvBuilder {
     /// layouts.
     #[must_use]
     pub fn uniform_buffer_standard_layout(mut self, v: bool) -> Self {
-        self.uniform_buffer_standard_layout = v;
+        self.validator.uniform_buffer_standard_layout = v;
         self
     }
 
@@ -458,7 +603,7 @@ impl SpirvBuilder {
     /// in effect this will override the --relax-block-layout option.
     #[must_use]
     pub fn scalar_block_layout(mut self, v: bool) -> Self {
-        self.scalar_block_layout = v;
+        self.validator.scalar_block_layout = v;
         self
     }
 
@@ -466,14 +611,14 @@ impl SpirvBuilder {
     /// --scalar-block-layout option.
     #[must_use]
     pub fn skip_block_layout(mut self, v: bool) -> Self {
-        self.skip_block_layout = v;
+        self.validator.skip_block_layout = v;
         self
     }
 
     /// Preserve unused descriptor bindings. Useful for reflection.
     #[must_use]
     pub fn preserve_bindings(mut self, v: bool) -> Self {
-        self.preserve_bindings = v;
+        self.optimizer.preserve_bindings = v;
         self
     }
 
@@ -488,7 +633,7 @@ impl SpirvBuilder {
     /// Set --default-features for the target shader crate.
     #[must_use]
     pub fn shader_crate_default_features(mut self, default_features: bool) -> Self {
-        self.shader_crate_features.default_features = Some(default_features);
+        self.shader_crate_features.default_features = default_features;
         self
     }
 
@@ -500,25 +645,24 @@ impl SpirvBuilder {
     }
 
     #[must_use]
-    pub fn rustc_codegen_spirv_location(
-        mut self,
-        path_to_dylib: impl AsRef<std::path::Path>,
-    ) -> Self {
-        let path_to_dylib = path_to_dylib.as_ref().to_path_buf();
-        assert!(
-            path_to_dylib.is_file(),
-            "Provided path to dylib '{}' is not a file",
-            path_to_dylib.display()
-        );
-        self.rustc_codegen_spirv_location = Some(path_to_dylib);
+    pub fn rustc_codegen_spirv_location(mut self, path_to_dylib: impl AsRef<Path>) -> Self {
+        self.rustc_codegen_spirv_location = Some(path_to_dylib.as_ref().to_path_buf());
+        self
+    }
+
+    /// Set the target dir path to use for building shaders. Relative paths will be resolved
+    /// relative to the `target` dir of the shader crate, absolute paths are used as is.
+    /// Defaults to `spirv-builder`, resulting in the path `./target/spirv-builder`.
+    #[must_use]
+    pub fn target_dir_path(mut self, name: impl Into<PathBuf>) -> Self {
+        self.target_dir_path = Some(name.into());
         self
     }
 
     /// Builds the module. If `print_metadata` is [`MetadataPrintout::Full`], you usually don't have to inspect the path
     /// in the result, as the environment variable for the path to the module will already be set.
-    pub fn build(mut self) -> Result<CompileResult, SpirvBuilderError> {
-        self.validate_running_conditions()?;
-        let metadata_file = invoke_rustc(&self)?;
+    pub fn build(&self) -> Result<CompileResult, SpirvBuilderError> {
+        let metadata_file = invoke_rustc(self)?;
         match self.print_metadata {
             MetadataPrintout::Full | MetadataPrintout::DependencyOnly => {
                 leaf_deps(&metadata_file, |artifact| {
@@ -532,43 +676,6 @@ impl SpirvBuilder {
         let metadata = self.parse_metadata_file(&metadata_file)?;
 
         Ok(metadata)
-    }
-
-    pub(crate) fn validate_running_conditions(&mut self) -> Result<(), SpirvBuilderError> {
-        let target_env = self
-            .target
-            .strip_prefix(SPIRV_TARGET_PREFIX)
-            .ok_or_else(|| SpirvBuilderError::NonSpirvTarget {
-                target: self.target.clone(),
-            })?;
-        // HACK(eddyb) used only to split the full list into groups.
-        #[allow(clippy::match_same_arms)]
-        match target_env {
-            // HACK(eddyb) hardcoded list to avoid checking if the JSON file
-            // for a particular target exists (and sanitizing strings for paths).
-            //
-            // FIXME(eddyb) consider moving this list, or even `target-specs`,
-            // into `rustc_codegen_spirv_types`'s code/source.
-            "spv1.0" | "spv1.1" | "spv1.2" | "spv1.3" | "spv1.4" | "spv1.5" => {}
-            "opengl4.0" | "opengl4.1" | "opengl4.2" | "opengl4.3" | "opengl4.5" => {}
-            "vulkan1.0" | "vulkan1.1" | "vulkan1.1spv1.4" | "vulkan1.2" => {}
-
-            _ => {
-                return Err(SpirvBuilderError::UnsupportedSpirvTargetEnv {
-                    target_env: target_env.into(),
-                });
-            }
-        }
-
-        if (self.print_metadata == MetadataPrintout::Full) && self.multimodule {
-            return Err(SpirvBuilderError::MultiModuleWithPrintMetadata);
-        }
-        if !self.path_to_crate.is_dir() {
-            return Err(SpirvBuilderError::CratePathDoesntExist(std::mem::take(
-                &mut self.path_to_crate,
-            )));
-        }
-        Ok(())
     }
 
     pub(crate) fn parse_metadata_file(
@@ -589,7 +696,7 @@ impl SpirvBuilder {
                         .unwrap()
                         .to_str()
                         .unwrap()
-                        .strip_suffix(".spv.json")
+                        .strip_suffix(ARTIFACT_SUFFIX)
                         .unwrap()
                 );
                 if self.print_metadata == MetadataPrintout::Full {
@@ -621,19 +728,23 @@ fn dylib_path() -> Vec<PathBuf> {
     }
 }
 
-fn find_rustc_codegen_spirv() -> PathBuf {
-    let filename = format!(
-        "{}rustc_codegen_spirv{}",
-        env::consts::DLL_PREFIX,
-        env::consts::DLL_SUFFIX
-    );
-    for mut path in dylib_path() {
-        path.push(&filename);
-        if path.is_file() {
-            return path;
+fn find_rustc_codegen_spirv() -> Result<PathBuf, SpirvBuilderError> {
+    if cfg!(feature = "rustc_codegen_spirv") {
+        let filename = format!(
+            "{}rustc_codegen_spirv{}",
+            env::consts::DLL_PREFIX,
+            env::consts::DLL_SUFFIX
+        );
+        for mut path in dylib_path() {
+            path.push(&filename);
+            if path.is_file() {
+                return Ok(path);
+            }
         }
+        panic!("Could not find {filename} in library path");
+    } else {
+        Err(SpirvBuilderError::MissingRustcCodegenSpirvDylib)
     }
-    panic!("Could not find {filename} in library path");
 }
 
 /// Joins strings together while ensuring none of the strings contain the separator.
@@ -648,6 +759,57 @@ fn join_checking_for_separators(strings: Vec<impl Borrow<str>>, sep: &str) -> St
 
 // Returns path to the metadata json.
 fn invoke_rustc(builder: &SpirvBuilder) -> Result<PathBuf, SpirvBuilderError> {
+    let target = builder
+        .target
+        .as_ref()
+        .ok_or(SpirvBuilderError::MissingTarget)?;
+    let path_to_crate = builder
+        .path_to_crate
+        .as_ref()
+        .ok_or(SpirvBuilderError::MissingCratePath)?;
+    {
+        let target_env = target.strip_prefix(SPIRV_TARGET_PREFIX).ok_or_else(|| {
+            SpirvBuilderError::NonSpirvTarget {
+                target: target.clone(),
+            }
+        })?;
+        // HACK(eddyb) used only to split the full list into groups.
+        #[allow(clippy::match_same_arms)]
+        match target_env {
+            // HACK(eddyb) hardcoded list to avoid checking if the JSON file
+            // for a particular target exists (and sanitizing strings for paths).
+            //
+            // FIXME(eddyb) consider moving this list, or even `target-specs`,
+            // into `rustc_codegen_spirv_types`'s code/source.
+            "spv1.0" | "spv1.1" | "spv1.2" | "spv1.3" | "spv1.4" | "spv1.5" | "spv1.6" => {}
+            "opengl4.0" | "opengl4.1" | "opengl4.2" | "opengl4.3" | "opengl4.5" => {}
+            "vulkan1.0" | "vulkan1.1" | "vulkan1.1spv1.4" | "vulkan1.2" | "vulkan1.3"
+            | "vulkan1.4" => {}
+
+            _ => {
+                return Err(SpirvBuilderError::UnsupportedSpirvTargetEnv {
+                    target_env: target_env.into(),
+                });
+            }
+        }
+
+        if (builder.print_metadata == MetadataPrintout::Full) && builder.multimodule {
+            return Err(SpirvBuilderError::MultiModuleWithPrintMetadata);
+        }
+        if !path_to_crate.is_dir() {
+            return Err(SpirvBuilderError::CratePathDoesntExist(
+                path_to_crate.clone(),
+            ));
+        }
+    }
+
+    let toolchain_rustc_version =
+        if let Some(toolchain_rustc_version) = &builder.toolchain_rustc_version {
+            toolchain_rustc_version.clone()
+        } else {
+            query_rustc_version(builder.toolchain_overwrite.as_deref())?
+        };
+
     // Okay, this is a little bonkers: in a normal world, we'd have the user clone
     // rustc_codegen_spirv and pass in the path to it, and then we'd invoke cargo to build it, grab
     // the resulting .so, and pass it into -Z codegen-backend. But that's really gross: the user
@@ -656,10 +818,14 @@ fn invoke_rustc(builder: &SpirvBuilder) -> Result<PathBuf, SpirvBuilderError> {
     // alongside build.rs, and cargo will helpfully add it to LD_LIBRARY_PATH for us! However,
     // rustc expects a full path, instead of a filename looked up via LD_LIBRARY_PATH, so we need
     // to copy cargo's understanding of library lookup and find the library and its full path.
-    let rustc_codegen_spirv = builder
-        .rustc_codegen_spirv_location
-        .clone()
-        .unwrap_or_else(find_rustc_codegen_spirv);
+    let rustc_codegen_spirv = Ok(builder.rustc_codegen_spirv_location.clone())
+        .transpose()
+        .unwrap_or_else(find_rustc_codegen_spirv)?;
+    if !rustc_codegen_spirv.is_file() {
+        return Err(SpirvBuilderError::RustcCodegenSpirvDylibDoesNotExist(
+            rustc_codegen_spirv,
+        ));
+    }
 
     let mut rustflags = vec![
         format!("-Zcodegen-backend={}", rustc_codegen_spirv.display()),
@@ -682,6 +848,13 @@ fn invoke_rustc(builder: &SpirvBuilder) -> Result<PathBuf, SpirvBuilderError> {
         // GVN currently can lead to the memcpy-out-of-const-alloc-global-var
         // pattern, even for `ScalarPair` (e.g. `return None::<u32>;`).
         "-Zmir-enable-passes=-GVN".to_string(),
+        // HACK(eddyb) avoid ever reusing instantiations from `compiler_builtins`
+        // which is special-cased to turn calls to functions that never return,
+        // into aborts, and this applies to the panics of UB-checking helpers
+        // (https://github.com/rust-lang/rust/pull/122580#issuecomment-3033026194)
+        // but while upstream that only loses the panic message, for us it's even
+        // worse, as we lose the chance to remove otherwise-dead `fmt::Arguments`.
+        "-Zshare-generics=off".to_string(),
     ];
 
     // Wrapper for `env::var` that appropriately informs Cargo of the dependency.
@@ -703,25 +876,25 @@ fn invoke_rustc(builder: &SpirvBuilder) -> Result<PathBuf, SpirvBuilderError> {
         }
         SpirvMetadata::Full => llvm_args.push("--spirv-metadata=full".to_string()),
     }
-    if builder.relax_struct_store {
+    if builder.validator.relax_struct_store {
         llvm_args.push("--relax-struct-store".to_string());
     }
-    if builder.relax_logical_pointer {
+    if builder.validator.relax_logical_pointer {
         llvm_args.push("--relax-logical-pointer".to_string());
     }
-    if builder.relax_block_layout {
+    if builder.validator.relax_block_layout.unwrap_or(false) {
         llvm_args.push("--relax-block-layout".to_string());
     }
-    if builder.uniform_buffer_standard_layout {
+    if builder.validator.uniform_buffer_standard_layout {
         llvm_args.push("--uniform-buffer-standard-layout".to_string());
     }
-    if builder.scalar_block_layout {
+    if builder.validator.scalar_block_layout {
         llvm_args.push("--scalar-block-layout".to_string());
     }
-    if builder.skip_block_layout {
+    if builder.validator.skip_block_layout {
         llvm_args.push("--skip-block-layout".to_string());
     }
-    if builder.preserve_bindings {
+    if builder.optimizer.preserve_bindings {
         llvm_args.push("--preserve-bindings".to_string());
     }
     let mut target_features = vec![];
@@ -770,31 +943,28 @@ fn invoke_rustc(builder: &SpirvBuilder) -> Result<PathBuf, SpirvBuilderError> {
         rustflags.extend(extra_rustflags.split_whitespace().map(|s| s.to_string()));
     }
 
-    // If we're nested in `cargo` invocation, use a different `--target-dir`,
-    // to avoid waiting on the same lock (which effectively dead-locks us).
-    let outer_target_dir = match (env::var("PROFILE"), env::var_os("OUT_DIR")) {
-        (Ok(outer_profile), Some(dir)) => {
-            // Strip `$outer_profile/build/*/out`.
-            [&outer_profile, "build", "*", "out"].iter().rev().try_fold(
-                PathBuf::from(dir),
-                |mut dir, &filter| {
-                    if (filter == "*" || dir.ends_with(filter)) && dir.pop() {
-                        Some(dir)
-                    } else {
-                        None
-                    }
-                },
-            )
-        }
-        _ => None,
+    let target_dir_path = builder
+        .target_dir_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("spirv-builder"));
+    let target_dir = if target_dir_path.is_absolute() {
+        target_dir_path
+    } else {
+        let metadata = cargo_metadata::MetadataCommand::new()
+            .current_dir(path_to_crate)
+            .exec()?;
+        metadata
+            .target_directory
+            .into_std_path_buf()
+            .join(target_dir_path)
     };
-    // FIXME(eddyb) use `crate metadata` to always be able to get the "outer"
-    // (or "default") `--target-dir`, to append `/spirv-builder` to it.
-    let target_dir = outer_target_dir.map(|outer| outer.join("spirv-builder"));
 
     let profile = if builder.release { "release" } else { "dev" };
 
     let mut cargo = Command::new("cargo");
+    if let Some(toolchain) = &builder.toolchain_overwrite {
+        cargo.arg(format!("+{toolchain}"));
+    }
     cargo.args([
         "build",
         "--lib",
@@ -811,18 +981,29 @@ fn invoke_rustc(builder: &SpirvBuilder) -> Result<PathBuf, SpirvBuilderError> {
 
     // FIXME(eddyb) consider moving `target-specs` into `rustc_codegen_spirv_types`.
     // FIXME(eddyb) consider the `RUST_TARGET_PATH` env var alternative.
-    cargo
-        .arg("--target")
-        .arg(builder.path_to_target_spec.clone().unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target-specs")
-                .join(format!("{}.json", builder.target))
-        }));
 
-    if let Some(default_features) = builder.shader_crate_features.default_features {
-        if !default_features {
-            cargo.arg("--no-default-features");
+    // NOTE(firestar99) rustc 1.76 has been tested to correctly parse modern
+    // target_spec jsons, some later version requires them, some earlier
+    // version fails with them (notably our 0.9.0 release)
+    if toolchain_rustc_version >= Version::new(1, 76, 0) {
+        let path_opt = builder.path_to_target_spec.clone();
+        let path;
+        #[cfg(feature = "include-target-specs")]
+        {
+            path = path_opt
+                .unwrap_or_else(|| PathBuf::from(format!("{TARGET_SPEC_DIR_PATH}/{target}.json")));
         }
+        #[cfg(not(feature = "include-target-specs"))]
+        {
+            path = path_opt.ok_or(SpirvBuilderError::MissingTargetSpec)?;
+        }
+        cargo.arg("--target").arg(path);
+    } else {
+        cargo.arg("--target").arg(target);
+    }
+
+    if !builder.shader_crate_features.default_features {
+        cargo.arg("--no-default-features");
     }
 
     if !builder.shader_crate_features.features.is_empty() {
@@ -831,10 +1012,7 @@ fn invoke_rustc(builder: &SpirvBuilder) -> Result<PathBuf, SpirvBuilderError> {
             .arg(builder.shader_crate_features.features.join(","));
     }
 
-    // NOTE(eddyb) see above how this is computed and why it might be missing.
-    if let Some(target_dir) = target_dir {
-        cargo.arg("--target-dir").arg(target_dir);
-    }
+    cargo.arg("--target-dir").arg(target_dir);
 
     // Clear Cargo environment variables that we don't want to leak into the
     // inner invocation of Cargo (because e.g. build scripts might read them),
@@ -853,6 +1031,12 @@ fn invoke_rustc(builder: &SpirvBuilder) -> Result<PathBuf, SpirvBuilderError> {
     // but in our case, `rustc_codegen_spirv` changes are also relevant,
     // so we turn off that caching with an env var, just to avoid any issues.
     cargo.env("CARGO_CACHE_RUSTC_INFO", "0");
+
+    // NOTE(firestar99) If you call SpirvBuilder in a build script, it will
+    // set `RUSTC` before calling it. And if we were to propagate it to our
+    // cargo invocation, it will take precedence over the `+toolchain` we
+    // previously set.
+    cargo.env_remove("RUSTC");
 
     // NOTE(eddyb) this used to be just `RUSTFLAGS` but at some point Cargo
     // added a separate environment variable using `\x1f` instead of spaces,
@@ -874,7 +1058,7 @@ fn invoke_rustc(builder: &SpirvBuilder) -> Result<PathBuf, SpirvBuilderError> {
 
     let build = cargo
         .stderr(Stdio::inherit())
-        .current_dir(&builder.path_to_crate)
+        .current_dir(path_to_crate)
         .output()
         .expect("failed to execute cargo build");
 
@@ -886,7 +1070,7 @@ fn invoke_rustc(builder: &SpirvBuilder) -> Result<PathBuf, SpirvBuilderError> {
         get_sole_artifact(&stdout).ok_or_else(|| {
             eprintln!("--- build output ---\n{stdout}");
             panic!(
-                "`{ARTIFACT_SUFFIX}` artifact not found in (supposedly successful) build output (see above)"
+                "`{ARTIFACT_SUFFIX}` artifact not found in (supposedly successful) build output (see above). Verify that `crate-type` is set correctly"
             );
         })
     } else {
@@ -903,22 +1087,21 @@ struct RustcOutput {
 const ARTIFACT_SUFFIX: &str = ".spv.json";
 
 fn get_sole_artifact(out: &str) -> Option<PathBuf> {
-    let last = out
-        .lines()
-        .filter_map(|line| {
-            if let Ok(line) = serde_json::from_str::<RustcOutput>(line) {
-                Some(line)
-            } else {
-                // Pass through invalid lines
-                println!("{line}");
-                None
-            }
-        })
-        .filter(|line| line.reason == "compiler-artifact")
-        .last()
-        .expect("Did not find output file in rustc output");
+    let mut last_compiler_artifact = None;
+    for line in out.lines() {
+        let Ok(msg) = serde_json::from_str::<RustcOutput>(line) else {
+            // Pass through invalid lines
+            println!("{line}");
+            continue;
+        };
+        if msg.reason == "compiler-artifact" {
+            last_compiler_artifact = Some(msg);
+        }
+    }
+    let last_compiler_artifact =
+        last_compiler_artifact.expect("Did not find output file in rustc output");
 
-    let mut filenames = last
+    let mut filenames = last_compiler_artifact
         .filenames
         .unwrap()
         .into_iter()
@@ -956,4 +1139,22 @@ fn leaf_deps(artifact: &Path, mut handle: impl FnMut(&RawStr)) -> std::io::Resul
     }
     recurse(&deps_map, artifact.to_str().unwrap().into(), &mut handle);
     Ok(())
+}
+
+pub fn query_rustc_version(toolchain: Option<&str>) -> std::io::Result<Version> {
+    let mut cmd = Command::new("rustc");
+    if let Some(toolchain) = toolchain {
+        cmd.arg(format!("+{toolchain}"));
+    }
+    cmd.arg("--version");
+    let output = cmd.output()?;
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be utf-8");
+    let parse = |output: &str| {
+        let output = output.strip_prefix("rustc ")?;
+        let version = &output[..output.find(|c| !"0123456789.".contains(c))?];
+        Version::parse(version).ok()
+    };
+    Ok(parse(&stdout)
+        .unwrap_or_else(|| panic!("failed parsing `rustc --version` output `{stdout}`")))
 }

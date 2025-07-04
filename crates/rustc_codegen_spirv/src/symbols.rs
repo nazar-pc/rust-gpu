@@ -1,8 +1,9 @@
 use crate::attr::{Entry, ExecutionModeExtra, IntrinsicType, SpecConstant, SpirvAttribute};
 use crate::builder::libm_intrinsics;
 use rspirv::spirv::{BuiltIn, ExecutionMode, ExecutionModel, StorageClass};
-use rustc_ast::ast::{AttrKind, Attribute, LitIntType, LitKind, MetaItemInner, MetaItemLit};
+use rustc_ast::ast::{LitIntType, LitKind, MetaItemInner, MetaItemLit};
 use rustc_data_structures::fx::FxHashMap;
+use rustc_hir::Attribute;
 use rustc_span::Span;
 use rustc_span::symbol::{Ident, Symbol};
 use std::rc::Rc;
@@ -13,15 +14,11 @@ use std::rc::Rc;
 /// already exists, deduplicating it if so. This makes things like comparison and cloning really cheap. So, this struct
 /// is to allocate all our keywords up front and intern them all, so we can do comparisons really easily and fast.
 pub struct Symbols {
-    // Used by `is_blocklisted_fn`.
-    pub fmt_decimal: Symbol,
-
     pub discriminant: Symbol,
     pub rust_gpu: Symbol,
     pub spirv: Symbol,
     pub libm: Symbol,
     pub entry_point_name: Symbol,
-    pub spv_intel_shader_integer_functions2: Symbol,
     pub spv_khr_vulkan_memory_model: Symbol,
 
     descriptor_set: Symbol,
@@ -120,6 +117,13 @@ const BUILTINS: &[(&str, BuiltIn)] = {
         ("bary_coord_no_persp_nv", BuiltIn::BaryCoordNoPerspNV),
         ("bary_coord", BaryCoordKHR),
         ("bary_coord_no_persp", BaryCoordNoPerspKHR),
+        ("primitive_point_indices_ext", PrimitivePointIndicesEXT),
+        ("primitive_line_indices_ext", PrimitiveLineIndicesEXT),
+        (
+            "primitive_triangle_indices_ext",
+            PrimitiveTriangleIndicesEXT,
+        ),
+        ("cull_primitive_ext", CullPrimitiveEXT),
         ("frag_size_ext", FragSizeEXT),
         ("frag_invocation_count_ext", FragInvocationCountEXT),
         ("launch_id", BuiltIn::LaunchIdKHR),
@@ -169,6 +173,7 @@ const STORAGE_CLASSES: &[(&str, StorageClass)] = {
         ("incoming_ray_payload", StorageClass::IncomingRayPayloadKHR),
         ("shader_record_buffer", StorageClass::ShaderRecordBufferKHR),
         ("physical_storage_buffer", PhysicalStorageBuffer),
+        ("task_payload_workgroup_ext", TaskPayloadWorkgroupEXT),
     ]
 };
 
@@ -183,6 +188,8 @@ const EXECUTION_MODELS: &[(&str, ExecutionModel)] = {
         ("compute", GLCompute),
         ("task_nv", TaskNV),
         ("mesh_nv", MeshNV),
+        ("task_ext", TaskEXT),
+        ("mesh_ext", MeshEXT),
         ("ray_generation", ExecutionModel::RayGenerationKHR),
         ("intersection", ExecutionModel::IntersectionKHR),
         ("any_hit", ExecutionModel::AnyHitKHR),
@@ -263,6 +270,17 @@ const EXECUTION_MODES: &[(&str, ExecutionMode, ExecutionModeExtraDim)] = {
         ("output_primitives_nv", OutputPrimitivesNV, Value),
         ("derivative_group_quads_nv", DerivativeGroupQuadsNV, None),
         ("output_triangles_nv", OutputTrianglesNV, None),
+        ("output_lines_ext", ExecutionMode::OutputLinesEXT, None),
+        (
+            "output_triangles_ext",
+            ExecutionMode::OutputTrianglesEXT,
+            None,
+        ),
+        (
+            "output_primitives_ext",
+            ExecutionMode::OutputPrimitivesEXT,
+            Value,
+        ),
         (
             "pixel_interlock_ordered_ext",
             PixelInterlockOrderedEXT,
@@ -334,6 +352,7 @@ impl Symbols {
             ("block", SpirvAttribute::Block),
             ("flat", SpirvAttribute::Flat),
             ("invariant", SpirvAttribute::Invariant),
+            ("per_primitive_ext", SpirvAttribute::PerPrimitiveExt),
             (
                 "sampled_image",
                 SpirvAttribute::IntrinsicType(IntrinsicType::SampledImage),
@@ -382,16 +401,11 @@ impl Symbols {
             assert!(old.is_none());
         }
         Self {
-            fmt_decimal: Symbol::intern("fmt_decimal"),
-
             discriminant: Symbol::intern("discriminant"),
             rust_gpu: Symbol::intern("rust_gpu"),
             spirv: Symbol::intern("spirv"),
             libm: Symbol::intern("libm"),
             entry_point_name: Symbol::intern("entry_point_name"),
-            spv_intel_shader_integer_functions2: Symbol::intern(
-                "SPV_INTEL_shader_integer_functions2",
-            ),
             spv_khr_vulkan_memory_model: Symbol::intern("SPV_KHR_vulkan_memory_model"),
 
             descriptor_set: Symbol::intern("descriptor_set"),
@@ -428,17 +442,17 @@ pub(crate) fn parse_attrs_for_checking<'a>(
     attrs: &'a [Attribute],
 ) -> impl Iterator<Item = Result<(Span, SpirvAttribute), ParseAttrError>> + 'a {
     attrs.iter().flat_map(move |attr| {
-        let (whole_attr_error, args) = match attr.kind {
-            AttrKind::Normal(ref normal) => {
+        let (whole_attr_error, args) = match attr {
+            Attribute::Unparsed(item) => {
                 // #[...]
-                let s = &normal.item.path.segments;
-                if s.len() > 1 && s[0].ident.name == sym.rust_gpu {
+                let s = &item.path.segments;
+                if s.len() > 1 && s[0].name == sym.rust_gpu {
                     // #[rust_gpu ...]
-                    if s.len() != 2 || s[1].ident.name != sym.spirv {
+                    if s.len() != 2 || s[1].name != sym.spirv {
                         // #[rust_gpu::...] but not #[rust_gpu::spirv]
                         (
                             Some(Err((
-                                attr.span,
+                                attr.span(),
                                 "unknown `rust_gpu` attribute, expected `rust_gpu::spirv`"
                                     .to_string(),
                             ))),
@@ -451,7 +465,7 @@ pub(crate) fn parse_attrs_for_checking<'a>(
                         // #[rust_gpu::spirv]
                         (
                             Some(Err((
-                                attr.span,
+                                attr.span(),
                                 "#[rust_gpu::spirv(..)] attribute must have at least one argument"
                                     .to_string(),
                             ))),
@@ -463,7 +477,7 @@ pub(crate) fn parse_attrs_for_checking<'a>(
                     (None, Default::default())
                 }
             }
-            AttrKind::DocComment(..) => (None, Default::default()), // doccomment
+            Attribute::Parsed(_) => (None, Default::default()),
         };
 
         whole_attr_error
@@ -717,7 +731,7 @@ fn parse_entry_attrs(
                 .execution_modes
                 .push((origin_mode, ExecutionModeExtra::new([])));
         }
-        GLCompute | MeshNV | TaskNV => {
+        GLCompute | MeshNV | TaskNV | TaskEXT | MeshEXT => {
             if let Some(local_size) = local_size {
                 entry
                     .execution_modes
@@ -726,7 +740,7 @@ fn parse_entry_attrs(
                 return Err((
                     arg.span(),
                     String::from(
-                        "The `threads` argument must be specified when using `#[spirv(compute)]`, `#[spirv(mesh_nv)]` or `#[spirv(task_nv)]`",
+                        "The `threads` argument must be specified when using `#[spirv(compute)]`, `#[spirv(mesh_nv)]`, `#[spirv(task_nv)]`, `#[spirv(task_ext)]` or `#[spirv(mesh_ext)]`",
                     ),
                 ));
             }

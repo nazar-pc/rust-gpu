@@ -3,12 +3,12 @@ use crate::builder_spirv::SpirvValue;
 use crate::codegen_cx::CodegenCx;
 use indexmap::IndexSet;
 use rspirv::dr::Operand;
-use rspirv::spirv::{Capability, Decoration, Dim, ImageFormat, StorageClass, Word};
+use rspirv::spirv::{Decoration, Dim, ImageFormat, StorageClass, Word};
+use rustc_abi::{AddressSpace, Align, HasDataLayout as _, Size};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::span_bug;
 use rustc_span::def_id::DefId;
 use rustc_span::{Span, Symbol};
-use rustc_target::abi::{Align, Size};
 use std::cell::RefCell;
 use std::fmt;
 use std::iter;
@@ -61,6 +61,11 @@ pub enum SpirvType<'tcx> {
     },
     Pointer {
         pointee: Word,
+
+        /// Address space, according to the Rust compiler, i.e. one of:
+        /// - `AddressSpace::DATA` for `*T`, `&T`, etc. (all except `fn` pointer)
+        /// - `data_layout.instruction_address_space` for `fn` pointers
+        addr_space: AddressSpace,
     },
     Function {
         return_type: Word,
@@ -105,21 +110,6 @@ impl SpirvType<'_> {
                 let result = cx.emit_global().type_int_id(id, width, signedness as u32);
                 let u_or_i = if signedness { "i" } else { "u" };
                 match width {
-                    8 if !cx.builder.has_capability(Capability::Int8) => cx.zombie_with_span(
-                        result,
-                        def_span,
-                        &format!("`{u_or_i}8` without `OpCapability Int8`"),
-                    ),
-                    16 if !cx.builder.has_capability(Capability::Int16) => cx.zombie_with_span(
-                        result,
-                        def_span,
-                        &format!("`{u_or_i}16` without `OpCapability Int16`"),
-                    ),
-                    64 if !cx.builder.has_capability(Capability::Int64) => cx.zombie_with_span(
-                        result,
-                        def_span,
-                        &format!("`{u_or_i}64` without `OpCapability Int64`"),
-                    ),
                     8 | 16 | 32 | 64 => {}
                     w => cx.zombie_with_span(
                         result,
@@ -132,16 +122,6 @@ impl SpirvType<'_> {
             Self::Float(width) => {
                 let result = cx.emit_global().type_float_id(id, width);
                 match width {
-                    16 if !cx.builder.has_capability(Capability::Float16) => cx.zombie_with_span(
-                        result,
-                        def_span,
-                        "`f16` without `OpCapability Float16`",
-                    ),
-                    64 if !cx.builder.has_capability(Capability::Float64) => cx.zombie_with_span(
-                        result,
-                        def_span,
-                        "`f64` without `OpCapability Float64`",
-                    ),
                     16 | 32 | 64 => (),
                     other => cx.zombie_with_span(
                         result,
@@ -182,51 +162,25 @@ impl SpirvType<'_> {
             Self::Vector { element, count } => cx.emit_global().type_vector_id(id, element, count),
             Self::Matrix { element, count } => cx.emit_global().type_matrix_id(id, element, count),
             Self::Array { element, count } => {
-                // ArrayStride decoration wants in *bytes*
-                let element_size = cx
-                    .lookup_type(element)
-                    .sizeof(cx)
-                    .expect("Element of sized array must be sized")
-                    .bytes();
-                let mut emit = cx.emit_global();
-                let result = emit.type_array_id(id, element, count.def_cx(cx));
-                emit.decorate(
-                    result,
-                    Decoration::ArrayStride,
-                    iter::once(Operand::LiteralBit32(element_size as u32)),
-                );
+                let result = cx
+                    .emit_global()
+                    .type_array_id(id, element, count.def_cx(cx));
+                Self::decorate_array_stride(result, element, cx);
                 result
             }
             Self::RuntimeArray { element } => {
-                let mut emit = cx.emit_global();
-                let result = emit.type_runtime_array_id(id, element);
-                // ArrayStride decoration wants in *bytes*
-                let element_size = cx
-                    .lookup_type(element)
-                    .sizeof(cx)
-                    .expect("Element of sized array must be sized")
-                    .bytes();
-                emit.decorate(
-                    result,
-                    Decoration::ArrayStride,
-                    iter::once(Operand::LiteralBit32(element_size as u32)),
-                );
+                let result = cx.emit_global().type_runtime_array_id(id, element);
+                Self::decorate_array_stride(result, element, cx);
                 result
             }
-            Self::Pointer { pointee } => {
-                // NOTE(eddyb) we emit `StorageClass::Generic` here, but later
-                // the linker will specialize the entire SPIR-V module to use
-                // storage classes inferred from `OpVariable`s.
-                let result = cx
-                    .emit_global()
-                    .type_pointer(id, StorageClass::Generic, pointee);
-                // no pointers to functions
-                if let SpirvType::Function { .. } = cx.lookup_type(pointee) {
-                    // FIXME(eddyb) use the `SPV_INTEL_function_pointers` extension.
-                    cx.zombie_with_span(result, def_span, "function pointer types are not allowed");
-                }
-                result
-            }
+            Self::Pointer {
+                pointee,
+                addr_space,
+            } => cx.emit_global().type_pointer(
+                id,
+                cx.addr_space_to_storage_class(addr_space, def_span),
+                pointee,
+            ),
             Self::Function {
                 return_type,
                 arguments,
@@ -278,6 +232,19 @@ impl SpirvType<'_> {
         result
     }
 
+    fn decorate_array_stride(result: u32, element: u32, cx: &CodegenCx<'_>) {
+        let mut emit = cx.emit_global();
+        let ty = cx.lookup_type(element);
+        if let Some(element_size) = ty.physical_size(cx) {
+            // ArrayStride decoration wants in *bytes*
+            emit.decorate(
+                result,
+                Decoration::ArrayStride,
+                iter::once(Operand::LiteralBit32(element_size.bytes() as u32)),
+            );
+        }
+    }
+
     /// `def_with_id` is used by the `RecursivePointeeCache` to handle `OpTypeForwardPointer`: when
     /// emitting the subsequent `OpTypePointer`, the ID is already known and must be re-used.
     pub fn def_with_id(self, cx: &CodegenCx<'_>, def_span: Span, id: Word) -> Word {
@@ -286,20 +253,14 @@ impl SpirvType<'_> {
             return cached;
         }
         let result = match self {
-            Self::Pointer { pointee } => {
-                // NOTE(eddyb) we emit `StorageClass::Generic` here, but later
-                // the linker will specialize the entire SPIR-V module to use
-                // storage classes inferred from `OpVariable`s.
-                let result =
-                    cx.emit_global()
-                        .type_pointer(Some(id), StorageClass::Generic, pointee);
-                // no pointers to functions
-                if let SpirvType::Function { .. } = cx.lookup_type(pointee) {
-                    // FIXME(eddyb) use the `SPV_INTEL_function_pointers` extension.
-                    cx.zombie_with_span(result, def_span, "function pointer types are not allowed");
-                }
-                result
-            }
+            Self::Pointer {
+                pointee,
+                addr_space,
+            } => cx.emit_global().type_pointer(
+                Some(id),
+                cx.addr_space_to_storage_class(addr_space, def_span),
+                pointee,
+            ),
             ref other => cx
                 .tcx
                 .dcx()
@@ -386,6 +347,35 @@ impl SpirvType<'_> {
         }
     }
 
+    /// Get the physical size of the type needed for explicit layout decorations.
+    #[allow(clippy::match_same_arms)]
+    pub fn physical_size(&self, cx: &CodegenCx<'_>) -> Option<Size> {
+        match *self {
+            // TODO(jwollen) Handle physical pointers (PhysicalStorageBuffer)
+            Self::Pointer { .. } => None,
+
+            Self::Adt { size, .. } => size,
+
+            Self::Array { element, count } => Some(
+                cx.lookup_type(element).physical_size(cx)?
+                    * cx.builder
+                        .lookup_const_scalar(count)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+            ),
+
+            // Always unsized types
+            Self::InterfaceBlock { .. } | Self::RayQueryKhr | Self::SampledImage { .. } => None,
+
+            // Descriptor types
+            Self::Image { .. } | Self::AccelerationStructureKhr | Self::Sampler => None,
+
+            // Primitive types
+            ty => ty.sizeof(cx),
+        }
+    }
+
     /// Replace `&[T]` fields with `&'tcx [T]` ones produced by calling
     /// `tcx.arena.dropless.alloc_slice(...)` - this is done late for two reasons:
     /// 1. it avoids allocating in the arena when the cache would be hit anyway,
@@ -412,7 +402,13 @@ impl SpirvType<'_> {
             SpirvType::Matrix { element, count } => SpirvType::Matrix { element, count },
             SpirvType::Array { element, count } => SpirvType::Array { element, count },
             SpirvType::RuntimeArray { element } => SpirvType::RuntimeArray { element },
-            SpirvType::Pointer { pointee } => SpirvType::Pointer { pointee },
+            SpirvType::Pointer {
+                pointee,
+                addr_space,
+            } => SpirvType::Pointer {
+                pointee,
+                addr_space,
+            },
             SpirvType::Image {
                 sampled_type,
                 dim,
@@ -557,10 +553,14 @@ impl fmt::Debug for SpirvTypePrinter<'_, '_> {
                 .field("id", &self.id)
                 .field("element", &self.cx.debug_type(element))
                 .finish(),
-            SpirvType::Pointer { pointee } => f
+            SpirvType::Pointer {
+                pointee,
+                addr_space,
+            } => f
                 .debug_struct("Pointer")
                 .field("id", &self.id)
                 .field("pointee", &self.cx.debug_type(pointee))
+                .field("addr_space", &addr_space)
                 .finish(),
             SpirvType::Function {
                 return_type,
@@ -710,8 +710,21 @@ impl SpirvTypePrinter<'_, '_> {
                 ty(self.cx, stack, f, element)?;
                 f.write_str("]")
             }
-            SpirvType::Pointer { pointee } => {
-                f.write_str("*")?;
+            SpirvType::Pointer {
+                pointee,
+                addr_space,
+            } => {
+                match addr_space {
+                    AddressSpace::DATA => {
+                        f.write_str("*")?;
+                    }
+                    _ if addr_space == self.cx.data_layout().instruction_address_space => {
+                        f.write_str("*ⁱ ")?;
+                    }
+                    _ => {
+                        write!(f, "*{{??? unrecognized {addr_space:?} ???}} ")?;
+                    }
+                }
                 ty(self.cx, stack, f, pointee)
             }
             SpirvType::Function {
@@ -813,6 +826,32 @@ impl<'tcx> CodegenCx<'tcx> {
                 {ty}",
                 ty = ty.debug(id, self)
             );
+        }
+    }
+
+    // HACK(eddyb) this is only here because it's mostly used by the methods of
+    // `SpirvType` (`def`/`def_with_id`), but also `abi::RecursivePointeeCache`.
+    pub(crate) fn addr_space_to_storage_class(
+        &self,
+        addr_space: AddressSpace,
+        def_span: Span,
+    ) -> StorageClass {
+        match addr_space {
+            // NOTE(eddyb) we emit `StorageClass::Generic` here, but later
+            // the linker will specialize the entire SPIR-V module to use
+            // storage classes inferred from `OpVariable`s.
+            AddressSpace::DATA => StorageClass::Generic,
+
+            // NOTE(eddyb) all relevant zombies are emitted on values,
+            // *not* the type, to maximize the specificity of errors.
+            _ if addr_space == self.data_layout().instruction_address_space => {
+                StorageClass::CodeSectionINTEL
+            }
+
+            _ => self.tcx.dcx().span_fatal(
+                def_span,
+                format!("unsupported {addr_space:?} for SPIR-V pointers"),
+            ),
         }
     }
 }

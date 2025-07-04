@@ -7,13 +7,14 @@ use crate::builder_spirv::{BuilderCursor, SpirvConst, SpirvValue, SpirvValueExt,
 use crate::codegen_cx::CodegenCx;
 use crate::custom_insts::{CustomInst, CustomOp};
 use crate::spirv_type::SpirvType;
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use rspirv::dr::{InsertPoint, Instruction, Operand};
 use rspirv::spirv::{Capability, MemoryModel, MemorySemantics, Op, Scope, StorageClass, Word};
+use rustc_abi::{Align, BackendRepr, Scalar, Size, WrappingRange};
 use rustc_apfloat::{Float, Round, Status, ieee};
 use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::common::{
-    AtomicOrdering, AtomicRmwBinOp, IntPredicate, RealPredicate, SynchronizationScope, TypeKind,
+    AtomicRmwBinOp, IntPredicate, RealPredicate, SynchronizationScope, TypeKind,
 };
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::PlaceRef;
@@ -25,15 +26,17 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::bug;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::ty::layout::LayoutOf;
-use rustc_middle::ty::{self, Ty};
+use rustc_middle::ty::{self, AtomicOrdering, Ty};
 use rustc_span::Span;
-use rustc_target::abi::call::FnAbi;
-use rustc_target::abi::{Align, BackendRepr, Scalar, Size, WrappingRange};
+use rustc_target::callconv::FnAbi;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::iter::{self, empty};
 use std::ops::RangeInclusive;
+
+use tracing::{Level, instrument, span};
+use tracing::{trace, warn};
 
 macro_rules! simple_op {
     (
@@ -136,11 +139,7 @@ fn memset_dynamic_scalar(
     .def(builder.span(), builder);
     let composite = builder
         .emit()
-        .composite_construct(
-            composite_type,
-            None,
-            iter::repeat(fill_var).take(byte_width),
-        )
+        .composite_construct(composite_type, None, iter::repeat_n(fill_var, byte_width))
         .unwrap();
     let result_type = if is_float {
         SpirvType::Float(byte_width as u32 * 8)
@@ -154,20 +153,19 @@ fn memset_dynamic_scalar(
 }
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
+    #[instrument(level = "trace", skip(self))]
     fn ordering_to_semantics_def(&self, ordering: AtomicOrdering) -> SpirvValue {
         let mut invalid_seq_cst = false;
         let semantics = match ordering {
-            AtomicOrdering::Unordered | AtomicOrdering::Relaxed => MemorySemantics::NONE,
-            // Note: rustc currently has AtomicOrdering::Consume commented out, if it ever becomes
-            // uncommented, it should be MakeVisible | Acquire.
+            AtomicOrdering::Relaxed => MemorySemantics::NONE,
             AtomicOrdering::Acquire => MemorySemantics::MAKE_VISIBLE | MemorySemantics::ACQUIRE,
             AtomicOrdering::Release => MemorySemantics::MAKE_AVAILABLE | MemorySemantics::RELEASE,
-            AtomicOrdering::AcquireRelease => {
+            AtomicOrdering::AcqRel => {
                 MemorySemantics::MAKE_AVAILABLE
                     | MemorySemantics::MAKE_VISIBLE
                     | MemorySemantics::ACQUIRE_RELEASE
             }
-            AtomicOrdering::SequentiallyConsistent => {
+            AtomicOrdering::SeqCst => {
                 let emit = self.emit();
                 let memory_model = emit.module_ref().memory_model.as_ref().unwrap();
                 if memory_model.operands[1].unwrap_memory_model() == MemoryModel::Vulkan {
@@ -182,18 +180,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         if invalid_seq_cst {
             self.zombie(
                 semantics.def(self),
-                "cannot use AtomicOrdering=SequentiallyConsistent on Vulkan memory model \
-                 (check if AcquireRelease fits your needs)",
+                "cannot use `AtomicOrdering::SeqCst` on Vulkan memory model \
+                 (check if `AcqRel` fits your needs)",
             );
         }
         semantics
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn memset_const_pattern(&self, ty: &SpirvType<'tcx>, fill_byte: u8) -> Word {
         match *ty {
             SpirvType::Void => self.fatal("memset invalid on void pattern"),
             SpirvType::Bool => self.fatal("memset invalid on bool pattern"),
-            SpirvType::Integer(width, _signedness) => match width {
+            SpirvType::Integer(width, false) => match width {
                 8 => self.constant_u8(self.span(), fill_byte).def(self),
                 16 => self
                     .constant_u16(self.span(), memset_fill_u16(fill_byte))
@@ -203,6 +202,21 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     .def(self),
                 64 => self
                     .constant_u64(self.span(), memset_fill_u64(fill_byte))
+                    .def(self),
+                _ => self.fatal(format!(
+                    "memset on integer width {width} not implemented yet"
+                )),
+            },
+            SpirvType::Integer(width, true) => match width {
+                8 => self.constant_i8(self.span(), fill_byte as i8).def(self),
+                16 => self
+                    .constant_i16(self.span(), memset_fill_u16(fill_byte) as i16)
+                    .def(self),
+                32 => self
+                    .constant_i32(self.span(), memset_fill_u32(fill_byte) as i32)
+                    .def(self),
+                64 => self
+                    .constant_i64(self.span(), memset_fill_u64(fill_byte) as i64)
                     .def(self),
                 _ => self.fatal(format!(
                     "memset on integer width {width} not implemented yet"
@@ -222,18 +236,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let elem_pat = self.memset_const_pattern(&self.lookup_type(element), fill_byte);
                 self.constant_composite(
                     ty.def(self.span(), self),
-                    iter::repeat(elem_pat).take(count as usize),
+                    iter::repeat_n(elem_pat, count as usize),
                 )
                 .def(self)
             }
             SpirvType::Array { element, count } => {
                 let elem_pat = self.memset_const_pattern(&self.lookup_type(element), fill_byte);
                 let count = self.builder.lookup_const_scalar(count).unwrap() as usize;
-                self.constant_composite(
-                    ty.def(self.span(), self),
-                    iter::repeat(elem_pat).take(count),
-                )
-                .def(self)
+                self.constant_composite(ty.def(self.span(), self), iter::repeat_n(elem_pat, count))
+                    .def(self)
             }
             SpirvType::RuntimeArray { .. } => {
                 self.fatal("memset on runtime arrays not implemented yet")
@@ -251,6 +262,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn memset_dynamic_pattern(&self, ty: &SpirvType<'tcx>, fill_var: Word) -> Word {
         match *ty {
             SpirvType::Void => self.fatal("memset invalid on void pattern"),
@@ -277,7 +289,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     .composite_construct(
                         ty.def(self.span(), self),
                         None,
-                        iter::repeat(elem_pat).take(count),
+                        iter::repeat_n(elem_pat, count),
                     )
                     .unwrap()
             }
@@ -287,7 +299,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     .composite_construct(
                         ty.def(self.span(), self),
                         None,
-                        iter::repeat(elem_pat).take(count as usize),
+                        iter::repeat_n(elem_pat, count as usize),
                     )
                     .unwrap()
             }
@@ -307,6 +319,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn memset_constant_size(&mut self, ptr: SpirvValue, pat: SpirvValue, size_bytes: u64) {
         let size_elem = self
             .lookup_type(pat.ty)
@@ -318,13 +331,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         } else {
             for index in 0..count {
                 let const_index = self.constant_u32(self.span(), index as u32);
-                let gep_ptr = self.gep(pat.ty, ptr, &[const_index]);
+                let gep_ptr = self.inbounds_gep(pat.ty, ptr, &[const_index]);
                 self.store(pat, gep_ptr, Align::from_bytes(0).unwrap());
             }
         }
     }
 
     // TODO: Test this is correct
+    #[instrument(level = "trace", skip(self))]
     fn memset_dynamic_size(&mut self, ptr: SpirvValue, pat: SpirvValue, size_bytes: SpirvValue) {
         let size_elem = self
             .lookup_type(pat.ty)
@@ -359,14 +373,17 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.switch_to_block(exit_bb);
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn zombie_convert_ptr_to_u(&self, def: Word) {
         self.zombie(def, "cannot convert pointers to integers");
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn zombie_convert_u_to_ptr(&self, def: Word) {
         self.zombie(def, "cannot convert integers to pointers");
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn zombie_ptr_equal(&self, def: Word, inst: &str) {
         if !self.builder.has_capability(Capability::VariablePointers) {
             self.zombie(
@@ -381,6 +398,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     //
     // HACK(eddyb) temporary workaround for untyped pointers upstream.
     // FIXME(eddyb) replace with untyped memory SPIR-V + `qptr` or similar.
+    #[instrument(level = "trace", skip(self), fields(ptr, ty = ?self.debug_type(ty)))]
     fn adjust_pointer_for_typed_access(
         &mut self,
         ptr: SpirvValue,
@@ -401,6 +419,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     //
     // HACK(eddyb) temporary workaround for untyped pointers upstream.
     // FIXME(eddyb) replace with untyped memory SPIR-V + `qptr` or similar.
+    #[instrument(level = "trace", skip(self))]
     fn adjust_pointer_for_sized_access(
         &mut self,
         ptr: SpirvValue,
@@ -408,12 +427,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) -> Option<(SpirvValue, <Self as BackendTypes>::Type)> {
         let ptr = ptr.strip_ptrcasts();
         let mut leaf_ty = match self.lookup_type(ptr.ty) {
-            SpirvType::Pointer { pointee } => pointee,
-            other => self.fatal(format!("non-pointer type: {other:?}")),
+            SpirvType::Pointer { pointee, .. } => pointee,
+            other => self.fatal(format!("`ptr` is non-pointer type: {other:?}")),
         };
 
-        // FIXME(eddyb) this isn't efficient, `recover_access_chain_from_offset`
-        // could instead be doing all the extra digging itself.
+        trace!(
+            "before nested adjust_pointer_for_sized_access. `leaf_ty`: {}",
+            self.debug_type(leaf_ty)
+        );
+
         let mut indices = SmallVec::<[_; 8]>::new();
         while let Some((inner_indices, inner_ty)) = self.recover_access_chain_from_offset(
             leaf_ty,
@@ -425,9 +447,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             leaf_ty = inner_ty;
         }
 
+        trace!(
+            "after nested adjust_pointer_for_sized_access. `leaf_ty`: {}",
+            self.debug_type(leaf_ty)
+        );
+
         let leaf_ptr_ty = (self.lookup_type(leaf_ty).sizeof(self) == Some(size))
             .then(|| self.type_ptr_to(leaf_ty))?;
-
         let leaf_ptr = if indices.is_empty() {
             assert_ty_eq!(self, ptr.ty, leaf_ptr_ty);
             ptr
@@ -441,6 +467,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 .unwrap()
                 .with_type(leaf_ptr_ty)
         };
+
+        trace!(
+            "adjust_pointer_for_sized_access returning {} {}",
+            self.debug_type(leaf_ptr.ty),
+            self.debug_type(leaf_ty)
+        );
         Some((leaf_ptr, leaf_ty))
     }
 
@@ -451,6 +483,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ///
     /// That is, try to turn `((_: *T) as *u8).add(offset) as *Leaf` into a series
     /// of struct field and array/vector element accesses.
+    #[instrument(level = "trace", skip(self), fields(ty = ?self.debug_type(ty), leaf_size_or_unsized_range, leaf_ty = ?leaf_ty))]
     fn recover_access_chain_from_offset(
         &self,
         mut ty: <Self as BackendTypes>::Type,
@@ -460,9 +493,17 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         leaf_ty: Option<<Self as BackendTypes>::Type>,
     ) -> Option<(SmallVec<[u32; 8]>, <Self as BackendTypes>::Type)> {
         assert_ne!(Some(ty), leaf_ty);
+        if let Some(leaf_ty) = leaf_ty {
+            trace!(
+                "recovering access chain: leaf_ty: {:?}",
+                self.debug_type(leaf_ty)
+            );
+        } else {
+            trace!("recovering access chain: leaf_ty: None");
+        }
 
         // HACK(eddyb) this has the correct ordering (`Sized(_) < Unsized`).
-        #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+        #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
         enum MaybeSized {
             Sized(Size),
             Unsized,
@@ -473,6 +514,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 [r.start(), r.end()].map(|x| x.map_or(MaybeSized::Unsized, MaybeSized::Sized));
             start..=end
         };
+
+        trace!("leaf_size_range: {:?}", leaf_size_range);
 
         // NOTE(eddyb) `ty` and `ty_kind`/`ty_size` should be kept in sync.
         let mut ty_kind = self.lookup_type(ty);
@@ -486,6 +529,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     field_offsets,
                     ..
                 } => {
+                    trace!("recovering access chain from ADT");
                     let (i, field_ty, field_ty_kind, field_ty_size, offset_in_field) = field_offsets
                         .iter()
                         .enumerate()
@@ -515,18 +559,25 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         })?;
 
                     ty = field_ty;
+                    trace!("setting ty = field_ty: {:?}", self.debug_type(field_ty));
                     ty_kind = field_ty_kind;
+                    trace!("setting ty_kind = field_ty_kind: {:?}", field_ty_kind);
                     ty_size = field_ty_size;
+                    trace!("setting ty_size = field_ty_size: {:?}", field_ty_size);
 
                     indices.push(i as u32);
                     offset = offset_in_field;
+                    trace!("setting offset = offset_in_field: {:?}", offset_in_field);
                 }
                 SpirvType::Vector { element, .. }
                 | SpirvType::Array { element, .. }
                 | SpirvType::RuntimeArray { element }
                 | SpirvType::Matrix { element, .. } => {
+                    trace!("recovering access chain from Vector, Array, RuntimeArray, or Matrix");
                     ty = element;
+                    trace!("setting ty = element: {:?}", self.debug_type(element));
                     ty_kind = self.lookup_type(ty);
+                    trace!("looked up ty kind: {:?}", ty_kind);
 
                     let stride = ty_kind.sizeof(self)?;
                     ty_size = MaybeSized::Sized(stride);
@@ -534,171 +585,243 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     indices.push((offset.bytes() / stride.bytes()).try_into().ok()?);
                     offset = Size::from_bytes(offset.bytes() % stride.bytes());
                 }
-                _ => return None,
+                _ => {
+                    trace!("recovering access chain from SOMETHING ELSE, RETURNING NONE");
+                    return None;
+                }
             }
 
             // Avoid digging beyond the point the leaf could actually fit.
             if ty_size < *leaf_size_range.start() {
+                trace!("avoiding digging beyond the point the leaf could actually fit");
                 return None;
             }
 
             if offset == Size::ZERO
                 && leaf_size_range.contains(&ty_size)
-                && leaf_ty.map_or(true, |leaf_ty| leaf_ty == ty)
+                && leaf_ty.is_none_or(|leaf_ty| leaf_ty == ty)
             {
+                trace!("successful recovery leaf type: {:?}", self.debug_type(ty));
+                trace!("successful recovery indices: {:?}", indices);
                 return Some((indices, ty));
             }
         }
     }
 
+    // NOTE(eddyb) see `ptr_offset_strided`, which this now forwards to.
+    #[instrument(level = "trace", skip(self), fields(ty = ?self.debug_type(ty), ptr, combined_indices = ?combined_indices.iter().map(|x| (self.debug_type(x.ty), x.kind)).collect::<Vec<_>>(), is_inbounds))]
     fn maybe_inbounds_gep(
         &mut self,
+        // Represents the type of the element that `ptr` is assumed to point to
+        // *before* applying the *first* index (`ptr_base_index`). This type is used
+        // primarily to calculate the size for the initial offset.
         ty: Word,
+        //  The base pointer value for the GEP operation.
         ptr: SpirvValue,
+        // A slice of indices used for the GEP calculation. The *first* index is treated
+        // as the main offset from the base pointer `ptr`, scaled by the size of `ty`.
+        // Subsequent indices navigate through nested aggregate types (structs, arrays,
+        // vectors, etc.) starting from `ty`.
         combined_indices: &[SpirvValue],
+        // If true, generate an `OpInBoundsAccessChain`, which has stricter requirements
+        // but allows more optimization. If false, generate `OpAccessChain`.
         is_inbounds: bool,
     ) -> SpirvValue {
-        let (&ptr_base_index, indices) = combined_indices.split_first().unwrap();
-
-        // The first index is an offset to the pointer, the rest are actual members.
+        // Separate the first index (used for the base offset) from the rest of the
+        // indices (used for navigating within the aggregate type). `ptr_base_index` is
+        // the index applied directly to `ptr`, effectively an offset multiplier based
+        // on the size of `ty`. `indices` are the subsequent indices used to drill down
+        // into fields or elements of `ty`.
         // https://llvm.org/docs/GetElementPtr.html
         // "An OpAccessChain instruction is the equivalent of an LLVM getelementptr instruction where the first index element is zero."
         // https://github.com/gpuweb/gpuweb/issues/33
-        let mut result_pointee_type = ty;
-        let indices: Vec<_> = indices
-            .iter()
-            .map(|index| {
-                result_pointee_type = match self.lookup_type(result_pointee_type) {
-                    SpirvType::Array { element, .. } | SpirvType::RuntimeArray { element } => {
-                        element
-                    }
-                    _ => self.fatal(format!(
-                        "GEP not implemented for type {}",
-                        self.debug_type(result_pointee_type)
-                    )),
-                };
-                index.def(self)
-            })
-            .collect();
+        let (&ptr_base_index, indices) = combined_indices.split_first().unwrap();
 
-        // Special-case field accesses through a `pointercast`, to access the
-        // right field in the original type, for the `Logical` addressing model.
-        let ptr = ptr.strip_ptrcasts();
-        let ptr_id = ptr.def(self);
-        let original_pointee_ty = match self.lookup_type(ptr.ty) {
-            SpirvType::Pointer { pointee } => pointee,
-            other => self.fatal(format!("gep called on non-pointer type: {other:?}")),
-        };
+        // HACK(eddyb) this effectively removes any real support for GEPs with
+        // any `indices` (beyond `ptr_base_index`), which should now be the case
+        // across `rustc_codegen_ssa` (see also comment inside `inbounds_gep`).
+        if !indices.is_empty() {
+            self.fatal(format!(
+                "[RUST-GPU BUG] `inbounds_gep` or `gep` called \
+                 with {} combined indices (expected only 1)",
+                combined_indices.len(),
+            ));
+        }
 
-        // HACK(eddyb) `struct_gep` itself is falling out of use, as it's being
-        // replaced upstream by `ptr_add` (aka `inbounds_gep` with byte offsets).
-        //
-        // FIXME(eddyb) get rid of everything other than:
-        // - constant byte offset (`ptr_add`?)
-        // - dynamic indexing of a single array
-        let const_ptr_offset = self
-            .builder
-            .lookup_const_scalar(ptr_base_index)
-            .and_then(|idx| Some(u64::try_from(idx).ok()? * self.lookup_type(ty).sizeof(self)?));
-        if let Some(const_ptr_offset) = const_ptr_offset {
-            if let Some((base_indices, base_pointee_ty)) = self.recover_access_chain_from_offset(
+        self.ptr_offset_strided(ptr, ty, ptr_base_index, is_inbounds)
+    }
+
+    /// Array-indexing-like pointer arithmetic, i.e. `(ptr: *T).offset(index)`
+    /// (or `wrapping_offset` instead of `offset`, for `is_inbounds = false`),
+    /// where `T` is given by `stride_elem_ty` (named so for extra clarity).
+    ///
+    /// This can produce legal SPIR-V by using 3 strategies:
+    /// 1. noop, i.e. returning `ptr` unmodified, comparable to a `pointercast`
+    ///    (but instead letting downstream users do any casts they might need,
+    ///     themselves - also, upstream untyped pointers mean that no pointer
+    ///     can be expected to have any specific pointee type)
+    /// 2. `recover_access_chain_from_offset` for constant offsets
+    ///    (e.g. from `ptradd`/`inbounds_ptradd` used to access `struct` fields)
+    /// 3. merging onto an array `OpAccessChain` with the same `stride_elem_ty`
+    ///    (possibly `&array[0]` from `pointercast` doing `*[T; N]` -> `*T`)
+    ///
+    /// Also, `pointercast` (used downstream, or as part of strategy 3.) helps
+    /// with producing legal SPIR-V, as it allows deferring whole casts chains,
+    /// and has a couple success modes of its own:
+    /// - itself can also use `recover_access_chain_from_offset`, supporting
+    ///   `struct`/array casts e.g. `*(T, U, ...)` -> `*T` / `*[T; N]` -> `*T`
+    /// - even if a specific cast is unsupported, legal SPIR-V can still be
+    ///   later obtained (thanks to `SpirvValueKind::LogicalPtrCast`), if all
+    ///   uses of that cast rely on `pointercast` and/or `strip_ptrcasts`, e.g.:
+    ///   - another `ptr_offset_strided` call (with a different offset)
+    ///   - `adjust_pointer_for_typed_access`/`adjust_pointer_for_sized_access`
+    ///     (themselves used by e.g. loads, stores, copies, etc.)
+    //
+    // FIXME(eddyb) maybe move the above `pointercast` section to its own docs?
+    #[instrument(level = "trace", skip(self), fields(ptr, stride_elem_ty = ?self.debug_type(stride_elem_ty), index, is_inbounds))]
+    fn ptr_offset_strided(
+        &mut self,
+        ptr: SpirvValue,
+        stride_elem_ty: Word,
+        index: SpirvValue,
+        is_inbounds: bool,
+    ) -> SpirvValue {
+        // Precompute a constant `index * stride` (i.e. effective pointer offset)
+        // if possible, as both strategies 1 and 2 rely on knowing this value.
+        let const_offset = self.builder.lookup_const_scalar(index).and_then(|idx| {
+            let idx_u64 = u64::try_from(idx).ok()?;
+            let stride = self.lookup_type(stride_elem_ty).sizeof(self)?;
+            Some(idx_u64 * stride)
+        });
+
+        // Strategy 1: do nothing for a `0` offset (and `stride_elem_ty` can be
+        // safely ignored, because any typed uses will `pointercast` if needed).
+        if const_offset == Some(Size::ZERO) {
+            trace!("ptr_offset_strided: strategy 1 picked: offset 0 => noop");
+
+            return ptr;
+        }
+
+        // Strategy 2: try recovering an `OpAccessChain` from a constant offset.
+        if let Some(const_offset) = const_offset {
+            // Remove any (redundant) pointer casts applied to the input `ptr`,
+            // to obtain the "most original" pointer (which ideally will be e.g.
+            // a whole `OpVariable`, or the result of a previous `OpAccessChain`).
+            let original_ptr = ptr.strip_ptrcasts();
+            let original_pointee_ty = match self.lookup_type(original_ptr.ty) {
+                SpirvType::Pointer { pointee, .. } => pointee,
+                other => self.fatal(format!("pointer arithmetic on non-pointer type {other:?}")),
+            };
+
+            if let Some((const_indices, leaf_pointee_ty)) = self.recover_access_chain_from_offset(
                 original_pointee_ty,
-                const_ptr_offset,
+                const_offset,
                 Some(Size::ZERO)..=None,
                 None,
             ) {
-                // FIXME(eddyb) this condition is pretty limiting, but
-                // eventually it shouldn't matter if GEPs are going away.
-                if ty == base_pointee_ty || indices.is_empty() {
-                    let result_pointee_type = if indices.is_empty() {
-                        base_pointee_ty
-                    } else {
-                        result_pointee_type
-                    };
-                    let indices = base_indices
-                        .into_iter()
-                        .map(|idx| self.constant_u32(self.span(), idx).def(self))
-                        .chain(indices)
-                        .collect();
-                    return self.emit_access_chain(
-                        self.type_ptr_to(result_pointee_type),
-                        ptr_id,
-                        None,
-                        indices,
-                        is_inbounds,
-                    );
-                }
+                trace!(
+                    "ptr_offset_strided: strategy 2 picked: offset {const_offset:?} \
+                     => access chain w/ {const_indices:?}"
+                );
+
+                let leaf_ptr_ty = self.type_ptr_to(leaf_pointee_ty);
+                let original_ptr_id = original_ptr.def(self);
+                let const_indices_ids = const_indices
+                    .into_iter()
+                    .map(|idx| self.constant_u32(self.span(), idx).def(self))
+                    .collect();
+
+                return self.emit_access_chain(
+                    leaf_ptr_ty,
+                    original_ptr_id,
+                    None,
+                    const_indices_ids,
+                    is_inbounds,
+                );
             }
         }
 
-        let result_type = self.type_ptr_to(result_pointee_type);
-
-        // Check if `ptr_id` is defined by an `OpAccessChain`, and if it is,
-        // grab its base pointer and indices.
-        //
-        // FIXME(eddyb) this could get ridiculously expensive, at the very least
-        // it could use `.rev()`, hoping the base pointer was recently defined?
-        let maybe_original_access_chain = if ty == original_pointee_ty {
-            let emit = self.emit();
-            let module = emit.module_ref();
-            let func = &module.functions[emit.selected_function().unwrap()];
-            let base_ptr_and_combined_indices = func
-                .all_inst_iter()
-                .find(|inst| inst.result_id == Some(ptr_id))
-                .and_then(|ptr_def_inst| {
-                    if matches!(
-                        ptr_def_inst.class.opcode,
-                        Op::AccessChain | Op::InBoundsAccessChain
-                    ) {
-                        let base_ptr = ptr_def_inst.operands[0].unwrap_id_ref();
-                        let indices = ptr_def_inst.operands[1..]
-                            .iter()
-                            .map(|op| op.unwrap_id_ref())
-                            .collect::<Vec<_>>();
-                        Some((base_ptr, indices))
-                    } else {
-                        None
-                    }
-                });
-            base_ptr_and_combined_indices
-        } else {
-            None
-        };
-        if let Some((original_ptr, mut original_indices)) = maybe_original_access_chain {
-            // Transform the following:
-            // OpAccessChain original_ptr [a, b, c]
-            // OpPtrAccessChain ptr base [d, e, f]
-            // into
-            // OpAccessChain original_ptr [a, b, c + base, d, e, f]
-            // to remove the need for OpPtrAccessChain
-            let last = original_indices.last_mut().unwrap();
-            *last = self
-                .add(last.with_type(ptr_base_index.ty), ptr_base_index)
-                .def(self);
-            original_indices.extend(indices);
-            return self.emit_access_chain(
-                result_type,
-                original_ptr,
-                None,
-                original_indices,
-                is_inbounds,
-            );
-        }
-
-        // HACK(eddyb) temporary workaround for untyped pointers upstream.
-        // FIXME(eddyb) replace with untyped memory SPIR-V + `qptr` or similar.
-        let ptr = self.pointercast(ptr, self.type_ptr_to(ty));
+        // Strategy 3: try merging onto an `OpAccessChain` of matching type,
+        // and this starts by `pointercast`-ing to that type for two reasons:
+        // - this is the only type a merged `OpAccessChain` could produce
+        // - `pointercast` can itself produce a new `OpAccessChain` in the
+        //   right circumstances (e.g. `&array[0]` for `*[T; N]` -> `*T`)
+        let ptr = self.pointercast(ptr, self.type_ptr_to(stride_elem_ty));
         let ptr_id = ptr.def(self);
 
-        self.emit_access_chain(
-            result_type,
-            ptr_id,
-            Some(ptr_base_index),
-            indices,
-            is_inbounds,
-        )
+        let maybe_original_access_chain = {
+            let emit = self.emit();
+            let module = emit.module_ref();
+            let current_func_blocks = emit
+                .selected_function()
+                .and_then(|func_idx| Some(&module.functions.get(func_idx)?.blocks[..]))
+                .unwrap_or_default();
+
+            // NOTE(eddyb) reverse search (`rfind`) used in the hopes that the
+            // instruction producing the value with ID `ptr_id` is more likely to
+            // have been added more recently to the function, even though there's
+            // still a risk of this causing a whole-function traversal.
+            //
+            // FIXME(eddyb) consider tracking that via e.g. `SpirvValueKind`.
+            current_func_blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .rfind(|inst| inst.result_id == Some(ptr_id))
+                .filter(|inst| {
+                    matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
+                })
+                .map(|inst| {
+                    let base_ptr = inst.operands[0].unwrap_id_ref();
+                    let indices = inst.operands[1..]
+                        .iter()
+                        .map(|op| op.unwrap_id_ref())
+                        .collect::<Vec<_>>();
+                    (base_ptr, indices)
+                })
+        };
+        if let Some((original_ptr, original_indices)) = maybe_original_access_chain {
+            trace!("ptr_offset_strided: strategy 3 picked: merging access chains");
+
+            let mut merged_indices = original_indices;
+
+            let last_index_id = merged_indices.last_mut().unwrap();
+            *last_index_id = self.add(last_index_id.with_type(index.ty), index).def(self);
+
+            return self.emit_access_chain(ptr.ty, original_ptr, None, merged_indices, is_inbounds);
+        }
+
+        // None of the legalizing strategies above applied, so this operation
+        // isn't really supported (and will error if actually used from a shader).
+        //
+        // FIXME(eddyb) supersede via SPIR-T pointer legalization (e.g. `qptr`).
+        trace!("ptr_offset_strided: falling back to (illegal) `OpPtrAccessChain`");
+
+        let result_ptr = if is_inbounds {
+            self.emit()
+                .in_bounds_ptr_access_chain(ptr.ty, None, ptr_id, index.def(self), vec![])
+        } else {
+            self.emit()
+                .ptr_access_chain(ptr.ty, None, ptr_id, index.def(self), vec![])
+        }
+        .unwrap();
+        self.zombie(
+            result_ptr,
+            "cannot offset a pointer to an arbitrary element",
+        );
+        result_ptr.with_type(ptr.ty)
     }
 
+    #[instrument(
+        level = "trace",
+        skip(self),
+        fields(
+            result_type = ?self.debug_type(result_type),
+             pointer,
+             ptr_base_index,
+             indices,
+             is_inbounds
+            )
+        )]
     fn emit_access_chain(
         &self,
         result_type: <Self as BackendTypes>::Type,
@@ -743,6 +866,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         .with_type(result_type)
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn fptoint_sat(
         &mut self,
         signed: bool,
@@ -922,6 +1046,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 
     // HACK(eddyb) helper shared by `typed_alloca` and `alloca`.
+    #[instrument(level = "trace", skip(self), fields(ty = ?self.debug_type(ty)))]
     fn declare_func_local_var(
         &mut self,
         ty: <Self as BackendTypes>::Type,
@@ -950,9 +1075,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         };
         // TODO: rspirv doesn't have insert_variable function
         let result_id = builder.id();
-        let inst = Instruction::new(Op::Variable, Some(ptr_ty), Some(result_id), vec![
-            Operand::StorageClass(StorageClass::Function),
-        ]);
+        let inst = Instruction::new(
+            Op::Variable,
+            Some(ptr_ty),
+            Some(result_id),
+            vec![Operand::StorageClass(StorageClass::Function)],
+        );
         builder.insert_into_block(index, inst).unwrap();
         result_id.with_type(ptr_ty)
     }
@@ -961,6 +1089,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     type CodegenCx = CodegenCx<'tcx>;
 
+    #[instrument(level = "trace", skip(cx))]
     fn build(cx: &'a Self::CodegenCx, llbb: Self::BasicBlock) -> Self {
         let cursor = cx.builder.select_block_by_id(llbb);
         // FIXME(eddyb) change `Self::Function` to be more like a function index.
@@ -1024,13 +1153,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 let ((line_start, col_start), (line_end, col_end)) =
                     (line_col_range.start, line_col_range.end);
 
-                self.custom_inst(void_ty, CustomInst::SetDebugSrcLoc {
-                    file: Operand::IdRef(file.file_name_op_string_id),
-                    line_start: Operand::IdRef(self.const_u32(line_start).def(self)),
-                    line_end: Operand::IdRef(self.const_u32(line_end).def(self)),
-                    col_start: Operand::IdRef(self.const_u32(col_start).def(self)),
-                    col_end: Operand::IdRef(self.const_u32(col_end).def(self)),
-                });
+                self.custom_inst(
+                    void_ty,
+                    CustomInst::SetDebugSrcLoc {
+                        file: Operand::IdRef(file.file_name_op_string_id),
+                        line_start: Operand::IdRef(self.const_u32(line_start).def(self)),
+                        line_end: Operand::IdRef(self.const_u32(line_end).def(self)),
+                        col_start: Operand::IdRef(self.const_u32(col_start).def(self)),
+                        col_end: Operand::IdRef(self.const_u32(col_end).def(self)),
+                    },
+                );
             }
 
             // HACK(eddyb) remove the previous instruction if made irrelevant.
@@ -1353,6 +1485,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         .with_type(val.ty)
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn checked_binop(
         &mut self,
         oop: OverflowOp,
@@ -1378,11 +1511,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let signed = match ty.kind() {
             ty::Int(_) => true,
             ty::Uint(_) => false,
-            other => self.fatal(format!("Unexpected {} type: {other:#?}", match oop {
-                OverflowOp::Add => "checked add",
-                OverflowOp::Sub => "checked sub",
-                OverflowOp::Mul => "checked mul",
-            })),
+            other => self.fatal(format!(
+                "Unexpected {} type: {other:#?}",
+                match oop {
+                    OverflowOp::Add => "checked add",
+                    OverflowOp::Sub => "checked sub",
+                    OverflowOp::Mul => "checked mul",
+                }
+            )),
         };
 
         let result = if is_add {
@@ -1522,7 +1658,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 place.val.llval,
                 place.val.align,
             );
-            OperandValue::Immediate(self.to_immediate(llval, place.layout))
+            OperandValue::Immediate(llval)
         } else if let BackendRepr::ScalarPair(a, b) = place.layout.backend_repr {
             let b_offset = a
                 .primitive()
@@ -1578,6 +1714,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             );
         }
     }
+
+    // FIXME(eddyb) `assume` is not implemented atm, so all of its forms should
+    // avoid computing its (potentially illegal) bool input in the first place.
+    fn assume_integer_range(&mut self, _imm: Self::Value, _ty: Self::Type, _range: WrappingRange) {}
+    fn assume_nonnull(&mut self, _val: Self::Value) {}
 
     fn range_metadata(&mut self, _load: Self::Value, _range: WrappingRange) {
         // ignore
@@ -1645,6 +1786,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         ptr: Self::Value,
         indices: &[Self::Value],
     ) -> Self::Value {
+        // HACK(eddyb) effectively a backport of this `gep [0, i]` -> `gep [i]`
+        // PR: https://github.com/rust-lang/rust/pull/134117 to even earlier
+        // nightlies - and that PR happens to remove the last GEP that can be
+        // emitted with any "structured" (struct/array) indices, beyond the
+        // "first index" (which acts as `<*T>::offset` aka "pointer arithmetic").
+        if let &[ptr_base_index, structured_index] = indices
+            && self.builder.lookup_const_scalar(ptr_base_index) == Some(0)
+            && let SpirvType::Array { element, .. } | SpirvType::RuntimeArray { element, .. } =
+                self.lookup_type(ty)
+        {
+            return self.maybe_inbounds_gep(element, ptr, &[structured_index], true);
+        }
+
         self.maybe_inbounds_gep(ty, ptr, indices, true)
     }
 
@@ -1722,6 +1876,29 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         if val.ty == dest_ty {
             val
         } else {
+            // If casting a constant, directly create a constant of the target type.
+            // This avoids creating intermediate types that might require additional
+            // capabilities. For example, casting a f16 constant to f32 will directly
+            // create a f32 constant, avoiding the need for Float16 capability if it is
+            // not used elsewhere.
+            if let Some(const_val) = self.builder.lookup_const_scalar(val)
+                && let (SpirvType::Float(src_width), SpirvType::Float(dst_width)) =
+                    (self.lookup_type(val.ty), self.lookup_type(dest_ty))
+                && src_width < dst_width
+            {
+                // Convert the bit representation to the actual float value
+                let float_val = match src_width {
+                    32 => Some(f32::from_bits(const_val as u32) as f64),
+                    64 => Some(f64::from_bits(const_val as u64)),
+                    _ => None,
+                };
+
+                if let Some(val) = float_val {
+                    return self.constant_float(dest_ty, val);
+                }
+            }
+
+            // Regular conversion
             self.emit()
                 .f_convert(dest_ty, None, val.def(self))
                 .unwrap()
@@ -1769,6 +1946,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
+    #[instrument(level = "trace", skip(self), fields(val_type = ?self.debug_type(val.ty), dest_ty = ?self.debug_type(dest_ty)))]
     fn bitcast(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
         if val.ty == dest_ty {
             val
@@ -1780,6 +1958,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             // in SPIR-V, but still being used to paper over untyped pointers,
             // by unpacking/repacking newtype-shaped aggregates as-needed.
             let unpack_newtype = |ty, kind| {
+                let span = span!(Level::DEBUG, "unpack_newtype");
+                let _guard = span.enter();
+
                 if !matches!(kind, SpirvType::Adt { .. } | SpirvType::Array { .. }) {
                     return None;
                 }
@@ -1808,12 +1989,25 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     .composite_extract(in_leaf_ty, None, val.def(self), indices)
                     .unwrap()
                     .with_type(in_leaf_ty);
+
+                trace!(
+                    "unpacked newtype. val: {} -> in_leaf_ty: {}",
+                    self.debug_type(val.ty),
+                    self.debug_type(in_leaf_ty),
+                );
                 return self.bitcast(in_leaf, dest_ty);
             }
+
             // Repack output newtypes, after bitcasting the leaf inside, instead.
             if let Some((indices, out_leaf_ty)) = unpack_newtype(dest_ty, dest_ty_kind) {
+                trace!(
+                    "unpacked newtype: dest: {} -> out_leaf_ty: {}",
+                    self.debug_type(dest_ty),
+                    self.debug_type(out_leaf_ty),
+                );
                 let out_leaf = self.bitcast(val, out_leaf_ty);
                 let out_agg_undef = self.undef(dest_ty);
+                trace!("returning composite insert");
                 return self
                     .emit()
                     .composite_insert(
@@ -1832,8 +2026,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
             // Reuse the pointer-specific logic in `pointercast` for `*T -> *U`.
             if val_is_ptr && dest_is_ptr {
+                trace!("val and dest are both pointers");
                 return self.pointercast(val, dest_ty);
             }
+
+            trace!(
+                "before emitting: val ty: {} -> dest ty: {}",
+                self.debug_type(val.ty),
+                self.debug_type(dest_ty)
+            );
 
             let result = self
                 .emit()
@@ -1863,6 +2064,46 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             // I guess?
             return val;
         }
+
+        // If casting a constant, directly create a constant of the target type. This
+        // avoids creating intermediate types that might require additional
+        // capabilities. For example, casting a u8 constant to u32 will directly create
+        // a u32 constant, avoiding the need for Int8 capability if it is not used
+        // elsewhere.
+        if let Some(const_val) = self.builder.lookup_const_scalar(val) {
+            let src_ty = self.lookup_type(val.ty);
+            let dst_ty_spv = self.lookup_type(dest_ty);
+
+            // Try to optimize the constant cast
+            let optimized_result = match (src_ty, dst_ty_spv) {
+                // Integer to integer cast
+                (SpirvType::Integer(src_width, _), SpirvType::Integer(dst_width, _)) => {
+                    // Only optimize if we're widening. This avoids creating the source
+                    // type when it's safe to do so. For narrowing casts (e.g., u32 as
+                    // u8), we need the proper truncation behavior that the regular cast
+                    // provides.
+                    if src_width < dst_width {
+                        Some(self.constant_int(dest_ty, const_val))
+                    } else {
+                        None
+                    }
+                }
+                // Bool to integer cast - const_val will be 0 or 1
+                (SpirvType::Bool, SpirvType::Integer(_, _)) => {
+                    Some(self.constant_int(dest_ty, const_val))
+                }
+                // Integer to bool cast - compare with zero
+                (SpirvType::Integer(_, _), SpirvType::Bool) => {
+                    Some(self.constant_bool(self.span(), const_val != 0))
+                }
+                _ => None,
+            };
+
+            if let Some(result) = optimized_result {
+                return result;
+            }
+        }
+
         match (self.lookup_type(val.ty), self.lookup_type(dest_ty)) {
             // sign change
             (
@@ -1915,32 +2156,40 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
+    #[instrument(level = "trace", skip(self), fields(ptr, ptr_ty = ?self.debug_type(ptr.ty), dest_ty = ?self.debug_type(dest_ty)))]
     fn pointercast(&mut self, ptr: Self::Value, dest_ty: Self::Type) -> Self::Value {
         // HACK(eddyb) reuse the special-casing in `const_bitcast`, which relies
         // on adding a pointer type to an untyped pointer (to some const data).
         if let SpirvValueKind::IllegalConst(_) = ptr.kind {
+            trace!("illegal const");
             return self.const_bitcast(ptr, dest_ty);
         }
 
         if ptr.ty == dest_ty {
+            trace!("ptr.ty == dest_ty");
             return ptr;
         }
 
         // Strip a previous `pointercast`, to reveal the original pointer type.
         let ptr = ptr.strip_ptrcasts();
 
+        trace!(
+            "ptr type after strippint pointer cases: {}",
+            self.debug_type(ptr.ty),
+        );
+
         if ptr.ty == dest_ty {
             return ptr;
         }
 
         let ptr_pointee = match self.lookup_type(ptr.ty) {
-            SpirvType::Pointer { pointee } => pointee,
+            SpirvType::Pointer { pointee, .. } => pointee,
             other => self.fatal(format!(
                 "pointercast called on non-pointer source type: {other:?}"
             )),
         };
         let dest_pointee = match self.lookup_type(dest_ty) {
-            SpirvType::Pointer { pointee } => pointee,
+            SpirvType::Pointer { pointee, .. } => pointee,
             other => self.fatal(format!(
                 "pointercast called on non-pointer dest type: {other:?}"
             )),
@@ -1953,6 +2202,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             dest_pointee_size..=dest_pointee_size,
             Some(dest_pointee),
         ) {
+            trace!("`recover_access_chain_from_offset` returned something");
+            trace!(
+                "ptr_pointee: {}, dest_pointee {}",
+                self.debug_type(ptr_pointee),
+                self.debug_type(dest_pointee),
+            );
             let indices = indices
                 .into_iter()
                 .map(|idx| self.constant_u32(self.span(), idx).def(self))
@@ -1962,6 +2217,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 .unwrap()
                 .with_type(dest_ty)
         } else {
+            trace!("`recover_access_chain_from_offset` returned `None`");
+            trace!(
+                "ptr_pointee: {}, dest_pointee {}",
+                self.debug_type(ptr_pointee),
+                self.debug_type(dest_pointee),
+            );
             // Defer the cast so that it has a chance to be avoided.
             let original_ptr = ptr.def(self);
             SpirvValue {
@@ -1975,9 +2236,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
-    fn icmp(&mut self, op: IntPredicate, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+    fn icmp(&mut self, op: IntPredicate, lhs: Self::Value, mut rhs: Self::Value) -> Self::Value {
         // Note: the signedness of the opcode doesn't have to match the signedness of the operands.
         use IntPredicate::*;
+
+        if lhs.ty != rhs.ty
+            && [lhs, rhs].map(|v| matches!(self.lookup_type(v.ty), SpirvType::Pointer { .. }))
+                == [true, true]
+        {
+            // HACK(eddyb) temporary workaround for untyped pointers upstream.
+            // FIXME(eddyb) replace with untyped memory SPIR-V + `qptr` or similar.
+            rhs = self.pointercast(rhs, lhs.ty);
+        }
+
         assert_ty_eq!(self, lhs.ty, rhs.ty);
         let b = SpirvType::Bool.def(self.span(), self);
         match self.lookup_type(lhs.ty) {
@@ -2144,7 +2415,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     self.emit().logical_or(b, None, lhs.def(self), rhs)
                 }
                 // x < y  =>  !x && y
-                IntULE => {
+                IntULT => {
+                    // intel-compute-runtime doesn't like OpLogicalNot
                     let true_ = self.constant_bool(self.span(), true);
                     let lhs = self
                         .emit()
@@ -2153,7 +2425,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     self.emit().logical_and(b, None, lhs, rhs.def(self))
                 }
                 // x <= y  =>  !x || y
-                IntULT => {
+                IntULE => {
+                    // intel-compute-runtime doesn't like OpLogicalNot
                     let true_ = self.constant_bool(self.span(), true);
                     let lhs = self
                         .emit()
@@ -2226,6 +2499,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         .with_type(b)
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn memcpy(
         &mut self,
         dst: Self::Value,
@@ -2250,19 +2524,36 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
 
         let typed_copy_dst_src = const_size.and_then(|const_size| {
+            trace!(
+                "adjusting pointers: src: {} -> dst: {}",
+                self.debug_type(src.ty),
+                self.debug_type(dst.ty),
+            );
             let dst_adj = self.adjust_pointer_for_sized_access(dst, const_size);
             let src_adj = self.adjust_pointer_for_sized_access(src, const_size);
             match (dst_adj, src_adj) {
                 // HACK(eddyb) fill in missing `dst`/`src` with the other side.
                 (Some((dst, access_ty)), None) => {
+                    trace!(
+                        "DESTINATION adjusted memcpy calling pointercast: dst ty: {}, access ty: {}",
+                        self.debug_type(dst.ty),
+                        self.debug_type(access_ty)
+                    );
                     Some((dst, self.pointercast(src, self.type_ptr_to(access_ty))))
                 }
                 (None, Some((src, access_ty))) => {
+                    trace!(
+                        "SOURCE adjusted memcpy calling pointercast: dst ty: {} -> access ty: {}, src ty: {}",
+                        self.debug_type(dst.ty),
+                        self.debug_type(access_ty),
+                        self.debug_type(src.ty)
+                    );
                     Some((self.pointercast(dst, self.type_ptr_to(access_ty)), src))
                 }
                 (Some((dst, dst_access_ty)), Some((src, src_access_ty)))
                     if dst_access_ty == src_access_ty =>
                 {
+                    trace!("BOTH adjusted memcpy calling pointercast");
                     Some((dst, src))
                 }
                 (None, None) | (Some(_), Some(_)) => None,
@@ -2271,8 +2562,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
         if let Some((dst, src)) = typed_copy_dst_src {
             if let Some(const_value) = src.const_fold_load(self) {
+                trace!("storing const value");
                 self.store(const_value, dst, Align::from_bytes(0).unwrap());
             } else {
+                trace!("copying memory using OpCopyMemory");
                 self.emit()
                     .copy_memory(dst.def(self), src.def(self), None, None, empty())
                     .unwrap();
@@ -2324,7 +2617,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             .and_then(|size| Some(Size::from_bytes(u64::try_from(size).ok()?)));
 
         let elem_ty = match self.lookup_type(ptr.ty) {
-            SpirvType::Pointer { pointee } => pointee,
+            SpirvType::Pointer { pointee, .. } => pointee,
             _ => self.fatal(format!(
                 "memset called on non-pointer type: {}",
                 self.debug_type(ptr.ty)
@@ -2394,14 +2687,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
         .def(self.span(), self);
         if self.builder.lookup_const(elt).is_some() {
-            self.constant_composite(result_type, iter::repeat(elt.def(self)).take(num_elts))
+            self.constant_composite(result_type, iter::repeat_n(elt.def(self), num_elts))
         } else {
             self.emit()
-                .composite_construct(
-                    result_type,
-                    None,
-                    iter::repeat(elt.def(self)).take(num_elts),
-                )
+                .composite_construct(result_type, None, iter::repeat_n(elt.def(self), num_elts))
                 .unwrap()
                 .with_type(result_type)
         }
@@ -2429,6 +2718,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             .with_type(result_type)
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn insert_value(&mut self, agg_val: Self::Value, elt: Self::Value, idx: u64) -> Self::Value {
         let field_type = match self.lookup_type(agg_val.ty) {
             SpirvType::Adt { field_types, .. } => field_types[idx as usize],
@@ -2678,13 +2968,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         funclet: Option<&Self::Funclet>,
         instance: Option<ty::Instance<'tcx>>,
     ) -> Self::Value {
+        let span = tracing::span!(tracing::Level::DEBUG, "call");
+        let _enter = span.enter();
+
         if funclet.is_some() {
             self.fatal("TODO: Funclets are not supported");
         }
 
-        // NOTE(eddyb) see the comment on `SpirvValueKind::FnAddr`, this should
-        // be fixed upstream, so we never see any "function pointer" values being
-        // created just to perform direct calls.
+        let mut func_call_opcode = Op::FunctionCall;
         let (callee_val, result_type, argument_types) = match self.lookup_type(callee.ty) {
             // HACK(eddyb) this seems to be needed, but it's not what `get_fn_addr`
             // produces, are these coming from inside `rustc_codegen_spirv`?
@@ -2696,24 +2987,35 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 (callee.def(self), return_type, arguments)
             }
 
-            SpirvType::Pointer { pointee } => match self.lookup_type(pointee) {
+            SpirvType::Pointer { pointee, .. } => match self.lookup_type(pointee) {
                 SpirvType::Function {
                     return_type,
                     arguments,
-                } => (
-                    if let SpirvValueKind::FnAddr { function } = callee.kind {
-                        assert_ty_eq!(self, callee_ty, pointee);
-                        function
-                    }
-                    // Truly indirect call.
-                    else {
-                        let fn_ptr_val = callee.def(self);
-                        self.zombie(fn_ptr_val, "indirect calls are not supported in SPIR-V");
-                        fn_ptr_val
-                    },
-                    return_type,
-                    arguments,
-                ),
+                } => {
+                    let direct_callee = self.builder.lookup_const(callee).and_then(
+                        |const_callee| match const_callee {
+                            SpirvConst::PtrToFunc {
+                                func_id,
+                                mangled_func_name: _,
+                            } => {
+                                assert_ty_eq!(self, callee_ty, pointee);
+                                Some(func_id)
+                            }
+                            _ => None,
+                        },
+                    );
+                    (
+                        direct_callee.unwrap_or_else(|| {
+                            // Truly indirect call.
+                            let fn_ptr_val = callee.def(self);
+                            self.zombie(fn_ptr_val, "indirect calls are not supported in SPIR-V");
+                            func_call_opcode = Op::FunctionPointerCallINTEL;
+                            fn_ptr_val
+                        }),
+                        return_type,
+                        arguments,
+                    )
+                }
                 _ => bug!(
                     "call expected `fn` pointer to point to function type, got `{}`",
                     self.debug_type(pointee)
@@ -2747,6 +3049,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             .and_then(|def_id| self.buffer_store_intrinsics.borrow().get(&def_id).copied());
         let is_panic_entry_point = instance_def_id
             .is_some_and(|def_id| self.panic_entry_points.borrow().contains(&def_id));
+        let from_trait_impl =
+            instance_def_id.and_then(|def_id| self.from_trait_impls.borrow().get(&def_id).copied());
 
         if let Some(libm_intrinsic) = libm_intrinsic {
             let result = self.call_libm_intrinsic(libm_intrinsic, result_type, args);
@@ -2758,8 +3062,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     self.debug_type(result.ty),
                 );
             }
-            result
-        } else if is_panic_entry_point {
+            return result;
+        }
+
+        if is_panic_entry_point {
             // HACK(eddyb) Rust 2021 `panic!` always uses `format_args!`, even
             // in the simple case that used to pass a `&str` constant, which
             // would not remain reachable in the SPIR-V - but `format_args!` is
@@ -2780,6 +3086,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 /// * `&a` with `typeof a` and ' ',
                 /// * `&b` with `typeof b` and 'x'
                 ref_arg_ids_with_ty_and_spec: SmallVec<[(Word, Ty<'tcx>, char); 2]>,
+
+                /// If `fmt::Arguments::new_v1_formatted` was used, this holds
+                /// the length of the `&[fmt::rt::Placeholder]` slice, which
+                /// currently cannot be directly supported, and therefore even
+                /// if all of `ref_arg_ids_with_ty_and_spec` are printable,
+                /// a much jankier fallback still has to be used, as it it were:
+                ///
+                /// `format!("a{{0}}b{{1}}c\n  with {{…}} from: {}, {}", x, y)`
+                /// (w/ `const_pieces = ["a", "b", "c"]` & `ref_args = [&x, &y]`).
+                has_unknown_fmt_placeholder_to_args_mapping: Option<usize>,
             }
             struct FormatArgsNotRecognized(String);
 
@@ -2794,14 +3110,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 let const_slice_as_elem_ids = |ptr_id: Word, len: usize| {
                     if let SpirvConst::PtrTo { pointee } =
                         self.builder.lookup_const_by_id(ptr_id)?
-                    {
-                        if let SpirvConst::Composite(elems) =
+                        && let SpirvConst::Composite(elems) =
                             self.builder.lookup_const_by_id(pointee)?
-                        {
-                            if elems.len() == len {
-                                return Some(elems);
-                            }
-                        }
+                        && elems.len() == len
+                    {
+                        return Some(elems);
                     }
                     None
                 };
@@ -2813,6 +3126,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                         .collect::<Option<Vec<u8>>>()?;
                     String::from_utf8(piece_str_bytes).ok()
                 };
+
+                // HACK(eddyb) `panic_explicit` doesn't take any regular arguments,
+                // only an (implicit) `&'static panic::Location<'static>`.
+                if args.len() == 1 {
+                    decoded_format_args.const_pieces =
+                        Some(["explicit panic".into()].into_iter().collect());
+                    return Ok(decoded_format_args);
+                }
 
                 // HACK(eddyb) some entry-points only take a `&str`, not `fmt::Arguments`.
                 if let [
@@ -2828,12 +3149,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 ] = args[..]
                 {
                     // Optional `&'static panic::Location<'static>`.
-                    if other_args.len() <= 1 {
-                        if let Some(const_msg) = const_str_as_utf8(&[a_id, b_id]) {
-                            decoded_format_args.const_pieces =
-                                Some([const_msg].into_iter().collect());
-                            return Ok(decoded_format_args);
-                        }
+                    if other_args.len() <= 1
+                        && let Some(const_msg) = const_str_as_utf8(&[a_id, b_id])
+                    {
+                        decoded_format_args.const_pieces = Some([const_msg].into_iter().collect());
+                        return Ok(decoded_format_args);
                     }
                 }
 
@@ -2909,6 +3229,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     Bitcast(ID, ID),
                     CompositeExtract(ID, ID, u32),
                     InBoundsAccessChain(ID, ID, u32),
+                    InBoundsAccessChain2(ID, ID, u32, u32),
                     Store(ID, ID),
                     Load(ID, ID),
                     CopyMemory(ID, ID),
@@ -2926,18 +3247,32 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
                 // Take `count` instructions, advancing backwards, but returning
                 // instructions in their original order (and decoded to `Inst`s).
-                let mut try_rev_take = |count| {
+                let mut try_rev_take = |count: isize| {
+                    // HACK(eddyb) this is extremely silly but it's easier to do
+                    // this than to rely on `Iterator::peekable` or anything else,
+                    // lower down this file, without messing up the state here.
+                    let is_peek = count < 0;
+                    let count = count.unsigned_abs();
+
+                    let mut non_debug_insts_for_peek = is_peek.then(|| non_debug_insts.clone());
+                    let non_debug_insts = non_debug_insts_for_peek
+                        .as_mut()
+                        .unwrap_or(&mut non_debug_insts);
+
+                    // FIXME(eddyb) there might be an easier way to do this,
+                    // e.g. maybe `map_while` + post-`collect` length check?
                     let maybe_rev_insts = (0..count).map(|_| {
                         let (i, inst) = non_debug_insts.next_back()?;
-                        taken_inst_idx_range.start.set(i);
+                        if !is_peek {
+                            taken_inst_idx_range.start.set(i);
+                        }
 
                         // HACK(eddyb) avoid the logic below that assumes only ID operands
-                        if inst.class.opcode == Op::CompositeExtract {
-                            if let (Some(r), &[Operand::IdRef(x), Operand::LiteralBit32(i)]) =
+                        if inst.class.opcode == Op::CompositeExtract
+                            && let (Some(r), &[Operand::IdRef(x), Operand::LiteralBit32(i)]) =
                                 (inst.result_id, &inst.operands[..])
-                            {
-                                return Some(Inst::CompositeExtract(r, x, i));
-                            }
+                        {
+                            return Some(Inst::CompositeExtract(r, x, i));
                         }
 
                         // HACK(eddyb) all instructions accepted below
@@ -2949,15 +3284,25 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                             .map(|operand| operand.id_ref_any())
                             .collect::<Option<SmallVec<[_; 4]>>>()?;
 
+                        let const_as_u32 = |id| match self.builder.lookup_const_by_id(id)? {
+                            SpirvConst::Scalar(x) => u32::try_from(x).ok(),
+                            _ => None,
+                        };
+
                         // Decode the instruction into one of our `Inst`s.
                         Some(
                             match (inst.class.opcode, inst.result_id, &id_operands[..]) {
                                 (Op::Bitcast, Some(r), &[x]) => Inst::Bitcast(r, x),
                                 (Op::InBoundsAccessChain, Some(r), &[p, i]) => {
-                                    if let Some(SpirvConst::Scalar(i)) =
-                                        self.builder.lookup_const_by_id(i)
-                                    {
-                                        Inst::InBoundsAccessChain(r, p, i as u32)
+                                    if let Some(i) = const_as_u32(i) {
+                                        Inst::InBoundsAccessChain(r, p, i)
+                                    } else {
+                                        Inst::Unsupported(inst.class.opcode)
+                                    }
+                                }
+                                (Op::InBoundsAccessChain, Some(r), &[p, i, j]) => {
+                                    if let [Some(i), Some(j)] = [i, j].map(const_as_u32) {
+                                        Inst::InBoundsAccessChain2(r, p, i, j)
                                     } else {
                                         Inst::Unsupported(inst.class.opcode)
                                     }
@@ -3002,6 +3347,80 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                             };
 
                             match call_args[..] {
+                                // `<core::fmt::Arguments>::new_v1_formatted`
+                                //
+                                // HACK(eddyb) this isn't fully supported,
+                                // as that would require digging into unstable
+                                // internals of `core::fmt::rt::Placeholder`s,
+                                // but the whole call still needs to be removed,
+                                // and both const str pieces and runtime args
+                                // can still be printed (even if in jankier way).
+                                [
+                                    pieces_slice_ptr_id,
+                                    pieces_len_id,
+                                    rt_args_slice_ptr_id,
+                                    rt_args_len_id,
+                                    fmt_placeholders_slice_ptr_id,
+                                    fmt_placeholders_len_id,
+                                ] if (pieces_len, rt_args_count) == (!0, !0) => {
+                                    let [pieces_len, rt_args_len, fmt_placeholders_len] = match [
+                                        pieces_len_id,
+                                        rt_args_len_id,
+                                        fmt_placeholders_len_id,
+                                    ]
+                                    .map(const_u32_as_usize)
+                                    {
+                                        [Some(a), Some(b), Some(c)] => [a, b, c],
+                                        _ => {
+                                            return Err(FormatArgsNotRecognized(
+                                                "fmt::Arguments::new_v1_formatted \
+                                                     with dynamic lengths"
+                                                    .into(),
+                                            ));
+                                        }
+                                    };
+
+                                    let prepare_args_insts = try_rev_take(2).ok_or_else(|| {
+                                        FormatArgsNotRecognized(
+                                            "fmt::Arguments::new_v1_formatted call: ran out of instructions".into(),
+                                        )
+                                    })?;
+                                    let (rt_args_slice_ptr_id, _fmt_placeholders_slice_ptr_id) =
+                                        match prepare_args_insts[..] {
+                                            [
+                                                Inst::Bitcast(
+                                                    rt_args_cast_out_id,
+                                                    rt_args_cast_in_id,
+                                                ),
+                                                Inst::Bitcast(
+                                                    placeholders_cast_out_id,
+                                                    placeholders_cast_in_id,
+                                                ),
+                                            ] if rt_args_cast_out_id == rt_args_slice_ptr_id
+                                                && placeholders_cast_out_id
+                                                    == fmt_placeholders_slice_ptr_id =>
+                                            {
+                                                (rt_args_cast_in_id, placeholders_cast_in_id)
+                                            }
+                                            _ => {
+                                                let mut insts = prepare_args_insts;
+                                                insts.extend(fmt_args_new_call_insts);
+                                                return Err(FormatArgsNotRecognized(format!(
+                                                    "fmt::Arguments::new_v1_formatted call sequence ({insts:?})",
+                                                )));
+                                            }
+                                        };
+
+                                    decoded_format_args
+                                        .has_unknown_fmt_placeholder_to_args_mapping =
+                                        Some(fmt_placeholders_len);
+
+                                    (
+                                        (pieces_slice_ptr_id, pieces_len),
+                                        (Some(rt_args_slice_ptr_id), rt_args_len),
+                                    )
+                                }
+
                                 // `<core::fmt::Arguments>::new_v1`
                                 [pieces_slice_ptr_id, rt_args_slice_ptr_id] => (
                                     (pieces_slice_ptr_id, pieces_len),
@@ -3044,47 +3463,94 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 if rt_args_count > 0 {
                     let rt_args_array_ptr_id = rt_args_slice_ptr_id.unwrap();
 
-                    // Each runtime argument has 4 instructions to call one of
+                    // Each runtime argument has A instructions to call one of
                     // the `fmt::rt::Argument::new_*` functions (and temporarily
-                    // store its result), and 4 instructions to copy it into
-                    // the appropriate slot in the array. The groups of 4 and 4
-                    // instructions, for all runtime args, are each separate.
-                    let copies_to_rt_args_array =
-                        try_rev_take(rt_args_count * 4).ok_or_else(|| {
+                    // store its result), and B instructions to copy it into
+                    // the appropriate slot in the array. The groups of A and B
+                    // instructions, for all runtime args, are each separate,
+                    // so the B×N later instructions are all processed first,
+                    // before moving (backwards) to the A×N earlier instructions.
+
+                    let rev_copies_to_rt_args_array_src_ptrs: SmallVec<[_; 4]> =
+                    (0..rt_args_count).rev().map(|rt_arg_idx| {
+                        let mut copy_to_rt_args_array_insts = try_rev_take(3).ok_or_else(|| {
                             FormatArgsNotRecognized(
-                                "[fmt::rt::Argument; N] copies: ran out of instructions".into(),
+                                "[fmt::rt::Argument; N] copy: ran out of instructions".into(),
                             )
                         })?;
-                    let copies_to_rt_args_array = copies_to_rt_args_array.chunks(4);
-                    let rt_arg_new_calls = try_rev_take(rt_args_count * 4).ok_or_else(|| {
-                        FormatArgsNotRecognized(
-                            "fmt::rt::Argument::new calls: ran out of instructions".into(),
-                        )
-                    })?;
-                    let rt_arg_new_calls = rt_arg_new_calls.chunks(4);
 
-                    for (rt_arg_idx, (rt_arg_new_call_insts, copy_to_rt_args_array_insts)) in
-                        rt_arg_new_calls.zip(copies_to_rt_args_array).enumerate()
-                    {
-                        let call_ret_slot_ptr = match rt_arg_new_call_insts[..] {
+                        // HACK(eddyb) account for both the split and combined
+                        // access chain cases that `inbounds_gep` can now cause.
+                        if let Inst::InBoundsAccessChain(dst_field_ptr, dst_base_ptr, 0) =
+                            copy_to_rt_args_array_insts[0]
+                            && let Some(mut prev_insts) = try_rev_take(1) {
+                                assert_eq!(prev_insts.len(), 1);
+                                let prev_inst = prev_insts.pop().unwrap();
+
+                                match prev_inst {
+                                    Inst::InBoundsAccessChain(
+                                        array_elem_ptr,
+                                        array_ptr,
+                                        idx,
+                                    ) if dst_base_ptr == array_elem_ptr => {
+                                        copy_to_rt_args_array_insts[0] =
+                                            Inst::InBoundsAccessChain2(dst_field_ptr, array_ptr, idx, 0);
+                                    }
+                                    _ => {
+                                        // HACK(eddyb) don't lose the taken `prev_inst`.
+                                        copy_to_rt_args_array_insts.insert(0, prev_inst);
+                                    }
+                                }
+                            }
+
+                        match copy_to_rt_args_array_insts[..] {
+                            [
+                                Inst::InBoundsAccessChain2(dst_field_ptr, dst_array_base_ptr, array_idx, 0),
+                                Inst::InBoundsAccessChain(src_field_ptr, src_base_ptr, 0),
+                                Inst::CopyMemory(copy_dst, copy_src),
+                            ] if dst_array_base_ptr == rt_args_array_ptr_id
+                                && array_idx as usize == rt_arg_idx
+                                && (copy_dst, copy_src) == (dst_field_ptr, src_field_ptr) =>
+                            {
+                                Ok(src_base_ptr)
+                            }
+                            _ => {
+                                Err(FormatArgsNotRecognized(format!(
+                                    "[fmt::rt::Argument; N] copy sequence ({copy_to_rt_args_array_insts:?})"
+                                )))
+                            }
+                        }
+                    }).collect::<Result<_, _>>()?;
+
+                    // HACK(eddyb) sometimes there is an extra tuple of refs,
+                    // nowadays, but MIR opts mean it's not always guaranteed,
+                    // hopefully it's always uniform across all the arguments.
+                    let mut maybe_ref_args_tmp_slot_ptr = None;
+
+                    let rev_maybe_ref_arg_ids_with_ty_and_spec = ((0..rt_args_count)
+                        .rev()
+                        .zip_eq(rev_copies_to_rt_args_array_src_ptrs))
+                    .map(|(rt_arg_idx, copy_to_rt_args_array_src_ptr)| {
+                        let rt_arg_new_call_insts = try_rev_take(4).ok_or_else(|| {
+                            FormatArgsNotRecognized(
+                                "fmt::rt::Argument::new call: ran out of instructions".into(),
+                            )
+                        })?;
+                        let (ref_arg_id, ty, spec) = match rt_arg_new_call_insts[..] {
                             [
                                 Inst::Call(call_ret_id, callee_id, ref call_args),
                                 Inst::InBoundsAccessChain(tmp_slot_field_ptr, tmp_slot_ptr, 0),
                                 Inst::CompositeExtract(field, wrapper_newtype, 0),
                                 Inst::Store(st_dst_ptr, st_val),
                             ] if wrapper_newtype == call_ret_id
+                                && tmp_slot_ptr == copy_to_rt_args_array_src_ptr
                                 && (st_dst_ptr, st_val) == (tmp_slot_field_ptr, field) =>
                             {
                                 self.fmt_rt_arg_new_fn_ids_to_ty_and_spec
                                     .borrow()
                                     .get(&callee_id)
                                     .and_then(|&(ty, spec)| match call_args[..] {
-                                        [x] => {
-                                            decoded_format_args
-                                                .ref_arg_ids_with_ty_and_spec
-                                                .push((x, ty, spec));
-                                            Some(tmp_slot_ptr)
-                                        }
+                                        [x] => Some((x, ty, spec)),
                                         _ => None,
                                     })
                             }
@@ -3096,47 +3562,132 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                             ))
                         })?;
 
-                        match copy_to_rt_args_array_insts[..] {
-                            [
-                                Inst::InBoundsAccessChain(array_slot, array_base, array_idx),
-                                Inst::InBoundsAccessChain(dst_field_ptr, dst_base_ptr, 0),
-                                Inst::InBoundsAccessChain(src_field_ptr, src_base_ptr, 0),
-                                Inst::CopyMemory(copy_dst, copy_src),
-                            ] if array_base == rt_args_array_ptr_id
-                                && array_idx as usize == rt_arg_idx
-                                && dst_base_ptr == array_slot
-                                && src_base_ptr == call_ret_slot_ptr
-                                && (copy_dst, copy_src) == (dst_field_ptr, src_field_ptr) => {}
-                            _ => {
-                                return Err(FormatArgsNotRecognized(format!(
-                                    "[fmt::rt::Argument; N] copies sequence ({copy_to_rt_args_array_insts:?})"
-                                )));
+                        // HACK(eddyb) `0` (an invalid ID) is later used as a
+                        // placeholder (see also `maybe_ref_args_tmp_slot_ptr`).
+                        assert_ne!(ref_arg_id, 0);
+
+                        // HACK(eddyb) `try_rev_take(-2)` is "peeking", not taking.
+                        let maybe_ref_args_tuple_load_insts = try_rev_take(-2);
+                        let maybe_ref_arg_id = match maybe_ref_args_tuple_load_insts.as_deref() {
+                            Some(
+                                &[
+                                    Inst::InBoundsAccessChain(field_ptr, base_ptr, field_idx),
+                                    Inst::Load(ld_val, ld_src_ptr),
+                                ],
+                            ) if maybe_ref_args_tmp_slot_ptr
+                                .is_none_or(|expected| base_ptr == expected)
+                                && field_idx as usize == rt_arg_idx
+                                && (ld_val, ld_src_ptr) == (ref_arg_id, field_ptr) =>
+                            {
+                                // HACK(eddyb) consume the peeked instructions.
+                                try_rev_take(2).unwrap();
+
+                                maybe_ref_args_tmp_slot_ptr = Some(base_ptr);
+
+                                // HACK(eddyb) using `0` (an invalid ID) as a
+                                // placeholder to require further processing.
+                                0
+                            }
+                            _ => ref_arg_id,
+                        };
+
+                        Ok((maybe_ref_arg_id, ty, spec))
+                    })
+                    .collect::<Result<_, _>>()?;
+
+                    decoded_format_args.ref_arg_ids_with_ty_and_spec =
+                        rev_maybe_ref_arg_ids_with_ty_and_spec;
+                    decoded_format_args.ref_arg_ids_with_ty_and_spec.reverse();
+
+                    // HACK(eddyb) see above for context regarding the use of
+                    // `0` as placeholders and `maybe_ref_args_tmp_slot_ptr`.
+                    if let Some(ref_args_tmp_slot_ptr) = maybe_ref_args_tmp_slot_ptr {
+                        for (rt_arg_idx, (maybe_ref_arg_id, ..)) in decoded_format_args
+                            .ref_arg_ids_with_ty_and_spec
+                            .iter_mut()
+                            .enumerate()
+                            .rev()
+                        {
+                            if *maybe_ref_arg_id == 0 {
+                                let ref_arg_store_insts = try_rev_take(2).ok_or_else(|| {
+                                    FormatArgsNotRecognized(
+                                        "fmt::rt::Argument::new argument store: ran out of instructions".into(),
+                                    )
+                                })?;
+
+                                *maybe_ref_arg_id = match ref_arg_store_insts[..] {
+                                    [
+                                        Inst::InBoundsAccessChain(field_ptr, base_ptr, field_idx),
+                                        Inst::Store(st_dst_ptr, st_val),
+                                    ] if base_ptr == ref_args_tmp_slot_ptr
+                                        && field_idx as usize == rt_arg_idx
+                                        && st_dst_ptr == field_ptr =>
+                                    {
+                                        Some(st_val)
+                                    }
+                                    _ => None,
+                                }
+                                .ok_or_else(|| {
+                                    FormatArgsNotRecognized(format!(
+                                        "fmt::rt::Argument::new argument store sequence ({ref_arg_store_insts:?})"
+                                    ))
+                                })?;
                             }
                         }
                     }
                 }
 
                 // If the `pieces: &[&str]` slice needs a bitcast, it'll be here.
-                let pieces_slice_ptr_id = match try_rev_take(1).as_deref() {
-                    Some(&[Inst::Bitcast(out_id, in_id)]) if out_id == pieces_slice_ptr_id => in_id,
+                // HACK(eddyb) `try_rev_take(-1)` is "peeking", not taking.
+                let pieces_slice_ptr_id = match try_rev_take(-1).as_deref() {
+                    Some(&[Inst::Bitcast(out_id, in_id)]) if out_id == pieces_slice_ptr_id => {
+                        // HACK(eddyb) consume the peeked instructions.
+                        try_rev_take(1).unwrap();
+
+                        in_id
+                    }
                     _ => pieces_slice_ptr_id,
                 };
                 decoded_format_args.const_pieces =
-                    const_slice_as_elem_ids(pieces_slice_ptr_id, pieces_len).and_then(
-                        |piece_ids| {
-                            piece_ids
-                                .iter()
-                                .map(|&piece_id| {
-                                    match self.builder.lookup_const_by_id(piece_id)? {
-                                        SpirvConst::Composite(piece) => {
-                                            const_str_as_utf8(piece.try_into().ok()?)
-                                        }
-                                        _ => None,
+                    match const_slice_as_elem_ids(pieces_slice_ptr_id, pieces_len) {
+                        Some(piece_ids) => piece_ids
+                            .iter()
+                            .map(
+                                |&piece_id| match self.builder.lookup_const_by_id(piece_id)? {
+                                    SpirvConst::Composite(piece) => {
+                                        const_str_as_utf8(piece.try_into().ok()?)
                                     }
-                                })
-                                .collect::<Option<_>>()
+                                    _ => None,
+                                },
+                            )
+                            .collect::<Option<_>>(),
+                        // HACK(eddyb) minor upstream blunder results in at
+                        // least one instance of a runtime `[&str; 1]` array,
+                        // see also this comment left on the responsible PR:
+                        // https://github.com/rust-lang/rust/pull/129658#discussion_r2181834781
+                        // HACK(eddyb) `try_rev_take(-4)` is "peeking", not taking.
+                        None if pieces_len == 1 => match try_rev_take(-4).as_deref() {
+                            Some(
+                                &[
+                                    Inst::InBoundsAccessChain2(field0_ptr, array_ptr_0, 0, 0),
+                                    Inst::Store(st0_dst_ptr, st0_val),
+                                    Inst::InBoundsAccessChain2(field1_ptr, array_ptr_1, 0, 1),
+                                    Inst::Store(st1_dst_ptr, st1_val),
+                                ],
+                            ) if [array_ptr_0, array_ptr_1] == [pieces_slice_ptr_id; 2]
+                                && st0_dst_ptr == field0_ptr
+                                && st1_dst_ptr == field1_ptr =>
+                            {
+                                // HACK(eddyb) consume the peeked instructions.
+                                try_rev_take(4).unwrap();
+
+                                const_str_as_utf8(&[st0_val, st1_val])
+                                    .map(|s| [s].into_iter().collect())
+                            }
+                            _ => None,
                         },
-                    );
+                        None => None,
+                    };
 
                 // Keep all instructions up to (but not including) the last one
                 // confirmed above to be the first instruction of `format_args!`.
@@ -3150,63 +3701,111 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             let mut debug_printf_args = SmallVec::<[_; 2]>::new();
             let message = match try_decode_and_remove_format_args() {
                 Ok(DecodedFormatArgs {
-                    const_pieces,
+                    const_pieces: None, ..
+                }) => "<unknown message>".into(),
+
+                Ok(DecodedFormatArgs {
+                    const_pieces: Some(const_pieces),
                     ref_arg_ids_with_ty_and_spec,
+                    has_unknown_fmt_placeholder_to_args_mapping,
                 }) => {
-                    match const_pieces {
-                        Some(const_pieces) => {
-                            const_pieces
-                                .into_iter()
-                                .map(|s| Cow::Owned(s.replace('%', "%%")))
-                                .interleave(ref_arg_ids_with_ty_and_spec.iter().map(
-                                    |&(ref_id, ty, spec)| {
-                                        use rustc_target::abi::{
-                                            Float::*, Integer::*, Primitive::*,
-                                        };
+                    let args = ref_arg_ids_with_ty_and_spec
+                        .iter()
+                        .map(|&(ref_id, ty, spec)| {
+                            use rustc_abi::{Float::*, Integer::*, Primitive::*};
 
-                                        let layout = self.layout_of(ty);
+                            let layout = self.layout_of(ty);
 
-                                        let scalar = match layout.backend_repr {
-                                            BackendRepr::Scalar(scalar) => Some(scalar.primitive()),
-                                            _ => None,
-                                        };
-                                        let debug_printf_fmt = match (spec, scalar) {
-                                            // FIXME(eddyb) support more of these,
-                                            // potentially recursing to print ADTs.
-                                            (' ' | '?', Some(Int(I32, false))) => "%u",
-                                            ('x', Some(Int(I32, false))) => "%x",
-                                            (' ' | '?', Some(Int(I32, true))) => "%i",
-                                            (' ' | '?', Some(Float(F32))) => "%f",
+                            let scalar = match layout.backend_repr {
+                                BackendRepr::Scalar(scalar) => Some(scalar.primitive()),
+                                _ => None,
+                            };
+                            let debug_printf_fmt = match (spec, scalar) {
+                                // FIXME(eddyb) support more of these,
+                                // potentially recursing to print ADTs.
+                                (' ' | '?', Some(Int(I32, false))) => "%u",
+                                ('x', Some(Int(I32, false))) => "%x",
+                                (' ' | '?', Some(Int(I32, true))) => "%i",
+                                (' ' | '?', Some(Float(F32))) => "%f",
 
-                                            _ => "",
-                                        };
+                                _ => "",
+                            };
 
-                                        if debug_printf_fmt.is_empty() {
-                                            return Cow::Owned(
-                                                format!("{{/* unprintable {ty} */:{spec}}}")
-                                                    .replace('%', "%%"),
-                                            );
-                                        }
+                            if debug_printf_fmt.is_empty() {
+                                return Cow::Owned(
+                                    format!("{{/* unprintable {ty} */:{spec}}}").replace('%', "%%"),
+                                );
+                            }
 
-                                        let spirv_type = layout.spirv_type(self.span(), self);
-                                        debug_printf_args.push(
-                                            self.emit()
-                                                .load(spirv_type, None, ref_id, None, [])
-                                                .unwrap()
-                                                .with_type(spirv_type),
-                                        );
-                                        Cow::Borrowed(debug_printf_fmt)
-                                    },
-                                ))
-                                .collect::<String>()
-                        }
-                        None => "<unknown message>".into(),
-                    }
+                            let spirv_type = layout.spirv_type(self.span(), self);
+                            debug_printf_args.push(
+                                self.emit()
+                                    .load(spirv_type, None, ref_id, None, [])
+                                    .unwrap()
+                                    .with_type(spirv_type),
+                            );
+                            Cow::Borrowed(debug_printf_fmt)
+                        });
+
+                    // HACK(eddyb) due to `fmt::Arguments::new_v1_formatted`,
+                    // we can't always assume that all the formatting arguments
+                    // are used 1:1 as placeholders (i.e. between `const_pieces`).
+                    let (placeholder_count, placeholders_are_args) =
+                        match has_unknown_fmt_placeholder_to_args_mapping {
+                            Some(count) => (count, false),
+                            None => (args.len(), true),
+                        };
+
+                    // HACK(eddyb) extra sanity check to avoid visual mishaps.
+                    let valid_placeholder_count = placeholder_count
+                        .clamp(const_pieces.len().saturating_sub(1), const_pieces.len());
+                    let placeholders_are_args =
+                        placeholders_are_args && placeholder_count == valid_placeholder_count;
+
+                    // FIXME(eddyb) stop using `itertools`'s `intersperse`,
+                    // when it gets stabilized on `Iterator` instead.
+                    #[allow(unstable_name_collisions)]
+                    let (placeholders, suffix) = if placeholders_are_args {
+                        (Either::Left(args), None)
+                    } else {
+                        // See also `has_unknown_fmt_placeholder_to_args_mapping`
+                        // comment (which has an example for 3 pieces and 2 args).
+                        //
+                        // FIXME(eddyb) this could definitely be improved, but
+                        // so far this only really gets hit in esoteric `core`
+                        // internals (UB checks and `char::encode_utf{8,16}`).
+                        (
+                            Either::Right(
+                                (0..valid_placeholder_count).map(|i| format!("{{{i}}}").into()),
+                            ),
+                            Some(
+                                ["\n  with {…} from: ".into()]
+                                    .into_iter()
+                                    .chain(args.intersperse(", ".into())),
+                            ),
+                        )
+                    };
+
+                    const_pieces
+                        .into_iter()
+                        .map(|s| Cow::Owned(s.replace('%', "%%")))
+                        .interleave(placeholders)
+                        .chain(suffix.into_iter().flatten())
+                        .collect::<String>()
                 }
 
                 Err(FormatArgsNotRecognized(step)) => {
                     if let Some(current_span) = self.current_span {
-                        let mut warn = self.tcx.dcx().struct_span_warn(
+                        // HACK(eddyb) Cargo silences warnings in dependencies.
+                        let force_warn = |span, msg| -> rustc_errors::Diag<'_, ()> {
+                            rustc_errors::Diag::new(
+                                self.tcx.dcx(),
+                                rustc_errors::Level::ForceWarning,
+                                msg,
+                            )
+                            .with_span(span)
+                        };
+                        let mut warn = force_warn(
                             current_span,
                             "failed to find and remove `format_args!` construction for this `panic!`",
                         );
@@ -3232,24 +3831,74 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             // HACK(eddyb) redirect any possible panic call to an abort, to avoid
             // needing to materialize `&core::panic::Location` or `format_args!`.
             self.abort_with_kind_and_message_debug_printf("panic", message, debug_printf_args);
-            self.undef(result_type)
-        } else if let Some(mode) = buffer_load_intrinsic {
-            self.codegen_buffer_load_intrinsic(result_type, args, mode)
-        } else if let Some(mode) = buffer_store_intrinsic {
+            return self.undef(result_type);
+        }
+
+        if let Some(mode) = buffer_load_intrinsic {
+            return self.codegen_buffer_load_intrinsic(result_type, args, mode);
+        }
+
+        if let Some(mode) = buffer_store_intrinsic {
             self.codegen_buffer_store_intrinsic(args, mode);
 
             let void_ty = SpirvType::Void.def(rustc_span::DUMMY_SP, self);
-            SpirvValue {
+            return SpirvValue {
                 kind: SpirvValueKind::IllegalTypeUsed(void_ty),
                 ty: void_ty,
-            }
-        } else {
-            let args = args.iter().map(|arg| arg.def(self)).collect::<Vec<_>>();
-            self.emit()
-                .function_call(result_type, None, callee_val, args)
-                .unwrap()
-                .with_type(result_type)
+            };
         }
+
+        if let Some((source_ty, target_ty)) = from_trait_impl {
+            // Optimize From::from calls with constant arguments to avoid creating intermediate types.
+            // Since From is only implemented for safe conversions (widening conversions that preserve
+            // the numeric value), we can directly create a constant of the target type for primitive
+            // numeric types.
+            if let [arg] = args
+                && let Some(const_val) = self.builder.lookup_const_scalar(*arg)
+            {
+                use rustc_middle::ty::FloatTy;
+                let optimized_result = match (source_ty.kind(), target_ty.kind()) {
+                    // Integer widening conversions
+                    (ty::Uint(_), ty::Uint(_)) | (ty::Int(_), ty::Int(_)) => {
+                        Some(self.constant_int(result_type, const_val))
+                    }
+                    // Float widening conversions
+                    // TODO(@LegNeato): Handle more float types
+                    (ty::Float(FloatTy::F32), ty::Float(FloatTy::F64)) => {
+                        let float_val = f32::from_bits(const_val as u32) as f64;
+                        Some(self.constant_float(result_type, float_val))
+                    }
+                    // No optimization for narrowing conversions or unsupported types
+                    _ => None,
+                };
+
+                if let Some(result) = optimized_result {
+                    return result;
+                }
+            }
+        }
+
+        // Default: emit a regular function call
+        let operands = [callee_val]
+            .into_iter()
+            .chain(args.iter().map(|arg| arg.def(self)))
+            .map(Operand::IdRef)
+            .collect();
+
+        let mut builder = self.emit();
+        let result_id = builder.id();
+        builder
+            .insert_into_block(
+                InsertPoint::End,
+                Instruction::new(
+                    func_call_opcode,
+                    Some(result_type),
+                    Some(result_id),
+                    operands,
+                ),
+            )
+            .unwrap();
+        result_id.with_type(result_type)
     }
 
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {

@@ -6,6 +6,8 @@ ignore = [
     # HACK(eddyb) `instant` is unmaintained (`web-time` suggested replacement),
     # non-trivial to remove as e.g. even the latest `minifb` still uses it.
     "RUSTSEC-2024-0384",
+    # HACK(firestar99) `paste` is unmaintained, used by wgpu with no replacement available
+    "RUSTSEC-2024-0436",
 ]
 
 # This section is considered when running `cargo deny check bans`.
@@ -32,10 +34,6 @@ skip = [
     { name = "raw-window-handle", version = "=0.6.2" },
 
     # HACK(eddyb) the newer version hasn't propagated through the ecosystem yet.
-    { name = "cfg_aliases", version = "=0.1.1" },
-    { name = "cfg_aliases", version = "=0.2.1" },
-
-    # HACK(eddyb) the newer version hasn't propagated through the ecosystem yet.
     { name = "hashbrown", version = "=0.14.5" },
     { name = "hashbrown", version = "=0.15.2" },
 
@@ -56,6 +54,10 @@ skip-tree = [
     { name = "minifb", version = "=0.25.0", depth = 3 },
     # HACK(eddyb) `num_cpus` (a `tester` dep) uses older `hermit-abi`.
     { name = "num_cpus", version = "=1.16.0", depth = 2 },
+    # HACK(LegNeato) `tracing-tree` uses newer dependencies of `tracing`.
+    { name = "tracing-tree", version = "=0.3.1" },
+    # HACK(LegNeato) `thorin` has not yet released the version that bumps this.
+    { name = "gimli", version = "=0.30.0" },
 ]
 
 
