@@ -103,4 +103,7 @@ codegen-units = 1
 # - WIP: spv-const-fn-ptr
 # - WIP: scalar
 # - WIP: vector
-spirt = { git = "https://github.com/LykenSol/spirt", branch = "vector" }
+#
+# HACK(eddyb) dependency moved to `crates/rustc_codegen_spirv/Cargo.toml` for
+# easier testing by users.
+# spirt = { git = "https://github.com/LykenSol/spirt", branch = "vector" }
