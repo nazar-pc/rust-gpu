@@ -133,7 +133,7 @@ pub fn inline(sess: &Session, module: &mut Module) -> super::Result<()> {
         .map(Ok)
         .collect();
 
-    // Inline functions in post-order (aka inside-out aka bottom-out) - that is,
+    // Inline functions in post-order (aka inside-out aka bottom-up) - that is,
     // callees are processed before their callers, to avoid duplicating work.
     for func_idx in call_graph.post_order() {
         let mut function = mem::replace(&mut functions[func_idx], Err(FuncIsBeingInlined)).unwrap();

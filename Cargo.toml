@@ -85,3 +85,25 @@ codegen-units = 256
 #
 # rustflags = ["-Zshare-generics=off"]
 codegen-units = 1
+
+[patch.crates-io]
+# HACK(eddyb) temporary until a new SPIR-T release contains the following:
+# - https://github.com/Rust-GPU/spirt/pull/7
+# - https://github.com/Rust-GPU/spirt/pull/8
+# - https://github.com/Rust-GPU/spirt/pull/9
+# - https://github.com/Rust-GPU/spirt/pull/12
+# - WIP: node-attrs
+# - WIP: node-inputs
+# - WIP: node-child_regions
+# - WIP: data-inst-def-outputs
+# - WIP: data-inst-node-merge
+# - WIP: unblock
+# - WIP: var-io
+# - WIP: spv-const-op
+# - WIP: spv-const-fn-ptr
+# - WIP: scalar
+# - WIP: vector
+#
+# HACK(eddyb) dependency moved to `crates/rustc_codegen_spirv/Cargo.toml` for
+# easier testing by users.
+# spirt = { git = "https://github.com/LykenSol/spirt", branch = "vector" }

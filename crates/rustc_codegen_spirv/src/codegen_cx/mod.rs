@@ -4,7 +4,7 @@ mod entry;
 mod type_;
 
 use crate::builder::{ExtInst, InstructionTable};
-use crate::builder_spirv::{BuilderCursor, BuilderSpirv, SpirvConst, SpirvValue, SpirvValueKind};
+use crate::builder_spirv::{BuilderCursor, BuilderSpirv, SpirvConst, SpirvValue};
 use crate::custom_decorations::{CustomDecoration, SrcLocDecoration, ZombieDecoration};
 use crate::spirv_type::{SpirvType, SpirvTypePrinter, TypeCache};
 use crate::symbols::Symbols;
@@ -239,11 +239,19 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     pub fn type_ptr_to(&self, ty: Word) -> Word {
-        SpirvType::Pointer { pointee: ty }.def(DUMMY_SP, self)
+        SpirvType::Pointer {
+            pointee: ty,
+            addr_space: AddressSpace::DATA,
+        }
+        .def(DUMMY_SP, self)
     }
 
-    pub fn type_ptr_to_ext(&self, ty: Word, _address_space: AddressSpace) -> Word {
-        SpirvType::Pointer { pointee: ty }.def(DUMMY_SP, self)
+    pub fn type_ptr_to_ext(&self, ty: Word, addr_space: AddressSpace) -> Word {
+        SpirvType::Pointer {
+            pointee: ty,
+            addr_space,
+        }
+        .def(DUMMY_SP, self)
     }
 
     /// Zombie system:
@@ -473,11 +481,6 @@ impl CodegenArgs {
             );
             opts.optflag(
                 "",
-                "spirt-strip-custom-debuginfo-from-dumps",
-                "strip custom debuginfo instructions when dumping SPIR-T",
-            );
-            opts.optflag(
-                "",
                 "spirt-keep-debug-sources-in-dumps",
                 "keep file contents debuginfo when dumping SPIR-T",
             );
@@ -641,8 +644,6 @@ impl CodegenArgs {
             dump_post_inline: matches_opt_dump_dir_path("dump-post-inline"),
             dump_post_split: matches_opt_dump_dir_path("dump-post-split"),
             dump_spirt_passes: matches_opt_dump_dir_path("dump-spirt-passes"),
-            spirt_strip_custom_debuginfo_from_dumps: matches
-                .opt_present("spirt-strip-custom-debuginfo-from-dumps"),
             spirt_keep_debug_sources_in_dumps: matches
                 .opt_present("spirt-keep-debug-sources-in-dumps"),
             spirt_keep_unstructured_cfg_in_dumps: matches
@@ -862,28 +863,23 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
         self.get_fn_ext(instance)
     }
 
-    // NOTE(eddyb) see the comment on `SpirvValueKind::FnAddr`, this should
-    // be fixed upstream, so we never see any "function pointer" values being
-    // created just to perform direct calls.
     fn get_fn_addr(&self, instance: Instance<'tcx>) -> Self::Value {
         let function = self.get_fn(instance);
         let span = self.tcx.def_span(instance.def_id());
 
         let ty = SpirvType::Pointer {
             pointee: function.ty,
+            addr_space: self.data_layout().instruction_address_space,
         }
         .def(span, self);
 
-        // Create these `OpUndef`s up front, instead of on-demand in `SpirvValue::def`,
-        // because `SpirvValue::def` can't use `cx.emit()`.
-        self.def_constant(ty, SpirvConst::ZombieUndefForFnAddr);
-
-        SpirvValue {
-            kind: SpirvValueKind::FnAddr {
-                function: function.def_cx(self),
-            },
+        self.def_constant(
             ty,
-        }
+            SpirvConst::PtrToFunc {
+                func_id: function.def_cx(self),
+                mangled_func_name: self.tcx.symbol_name(instance).name,
+            },
+        )
     }
 
     fn eh_personality(&self) -> Self::Value {

@@ -13,7 +13,7 @@ use rspirv::spirv::{
     GroupOperation, ImageOperands, KernelProfilingInfo, LoopControl, MemoryAccess, MemorySemantics,
     Op, RayFlags, SelectionControl, StorageClass, Word,
 };
-use rustc_abi::{BackendRepr, Primitive};
+use rustc_abi::{AddressSpace, BackendRepr, Primitive};
 use rustc_ast::ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_codegen_ssa::mir::operand::OperandValue;
 use rustc_codegen_ssa::mir::place::PlaceRef;
@@ -392,6 +392,7 @@ impl<'cx, 'tcx> Builder<'cx, 'tcx> {
                 }
                 SpirvType::Pointer {
                     pointee: inst.operands[1].unwrap_id_ref(),
+                    addr_space: AddressSpace::DATA,
                 }
                 .def(self.span(), self)
             }
@@ -750,6 +751,7 @@ impl<'cx, 'tcx> Builder<'cx, 'tcx> {
 
                 TyPat::Pointer(_, pat) => SpirvType::Pointer {
                     pointee: subst_ty_pat(cx, pat, ty_vars, leftover_operands)?,
+                    addr_space: AddressSpace::DATA,
                 }
                 .def(DUMMY_SP, cx),
 
@@ -1005,7 +1007,7 @@ impl<'cx, 'tcx> Builder<'cx, 'tcx> {
                     Some(match kind {
                         TypeofKind::Plain => ty,
                         TypeofKind::Dereference => match self.lookup_type(ty) {
-                            SpirvType::Pointer { pointee } => pointee,
+                            SpirvType::Pointer { pointee, .. } => pointee,
                             other => {
                                 self.tcx.dcx().span_err(
                                     span,
@@ -1027,7 +1029,7 @@ impl<'cx, 'tcx> Builder<'cx, 'tcx> {
                     self.check_reg(span, reg);
                     if let Some(place) = place {
                         match self.lookup_type(place.val.llval.ty) {
-                            SpirvType::Pointer { pointee } => Some(pointee),
+                            SpirvType::Pointer { pointee, .. } => Some(pointee),
                             other => {
                                 self.tcx.dcx().span_err(
                                     span,

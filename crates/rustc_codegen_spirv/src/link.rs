@@ -5,7 +5,8 @@ use crate::codegen_cx::{CodegenArgs, SpirvMetadata};
 use crate::{SpirvCodegenBackend, SpirvModuleBuffer, SpirvThinBuffer, linker};
 use ar::{Archive, GnuBuilder, Header};
 use rspirv::binary::Assemble;
-use rspirv::dr::Module;
+use rspirv::dr::{Module, Operand};
+use rspirv::spirv::Op;
 use rustc_ast::CRATE_NODE_ID;
 use rustc_codegen_spirv_types::{CompileResult, ModuleResult};
 use rustc_codegen_ssa::back::lto::{LtoModuleCodegen, SerializedModule, ThinModule, ThinShared};
@@ -548,6 +549,81 @@ fn create_archive(files: &[&Path], metadata: &[u8], out_filename: &Path) {
     builder.into_inner().unwrap();
 }
 
+// HACK(eddyb) `rspirv`'s definitions of SPIR-V type/const instructions are
+// hardcoded *and* too narrow, compared to e.g. the SPIR-T ones (which rely
+// on *the combination* of `Type-Declaration`/`Constant-Creation` categories
+// *and* instruction name prefixes), so this `Consumer` adapter wraps those
+// instructions in `OpSpecConstantOp`, and then later unwraps all of them to
+// their original opcodes (this only works for type-declaring instructions,
+// as well, because `dr::Loader` only looks at the opcode and will always
+// push both types and consts to `types_global_values`, without distinction).
+// HACK(eddyb) `pub(crate)` just so `linker::link` can use it for module merging.
+#[derive(Default)]
+pub(crate) struct RspirvLoaderWithUnsupportedTypesConstsBypass(rspirv::dr::Loader);
+
+impl rspirv::binary::Consumer for RspirvLoaderWithUnsupportedTypesConstsBypass {
+    fn initialize(&mut self) -> rspirv::binary::ParseAction {
+        self.0.initialize()
+    }
+
+    fn finalize(&mut self) -> rspirv::binary::ParseAction {
+        self.0.finalize()
+    }
+
+    fn consume_header(&mut self, header: rspirv::dr::ModuleHeader) -> rspirv::binary::ParseAction {
+        self.0.consume_header(header)
+    }
+
+    fn consume_instruction(
+        &mut self,
+        mut inst: rspirv::dr::Instruction,
+    ) -> rspirv::binary::ParseAction {
+        use spirt::spv::spec;
+
+        // HACK(eddyb) as to make unwrapping trivial later on, `OpSpecConstantOp`
+        // is itself also wrapped (resulting in two `LiteralSpecConstantOpInteger`),
+        // which works just as well as wrapping types does: the invalid instructions
+        // are never inspected beyond their opcode being used to determine placement.
+        let opcode = inst.class.opcode;
+        let wrap_in_spec_const_op = opcode == Op::SpecConstantOp
+            || spec::Opcode::try_from_u16_with_name_and_def(opcode as u16).is_some_and(
+                |(_, _, def)| match def.category {
+                    spec::InstructionCategory::Type => !rspirv::grammar::reflect::is_type(opcode),
+                    spec::InstructionCategory::Const => {
+                        !rspirv::grammar::reflect::is_constant(opcode)
+                    }
+                    spec::InstructionCategory::ControlFlow | spec::InstructionCategory::Other => {
+                        false
+                    }
+                },
+            );
+
+        if wrap_in_spec_const_op {
+            inst.class = rspirv::grammar::CoreInstructionTable::get(Op::SpecConstantOp);
+            inst.operands
+                .insert(0, Operand::LiteralSpecConstantOpInteger(opcode));
+        }
+
+        self.0.consume_instruction(inst)
+    }
+}
+
+impl RspirvLoaderWithUnsupportedTypesConstsBypass {
+    pub(crate) fn module(self) -> Module {
+        let mut module = self.0.module();
+        for inst in &mut module.types_global_values {
+            // HACK(eddyb) see `consume_instruction` above for why this is unconditional.
+            if inst.class.opcode == Op::SpecConstantOp {
+                if let [Operand::LiteralSpecConstantOpInteger(opcode), ..] = inst.operands[..] {
+                    inst.class = rspirv::grammar::CoreInstructionTable::get(opcode);
+                    inst.operands.remove(0);
+                }
+            }
+        }
+        module
+    }
+}
+
 /// This is the actual guts of linking: the rest of the link-related functions are just digging through rustc's
 /// shenanigans to collect all the object files we need to link.
 fn do_link(
@@ -563,7 +639,7 @@ fn do_link(
     let mut modules = Vec::new();
     let mut add_module = |file_name: &OsStr, bytes: &[u8]| {
         let module = {
-            let mut loader = rspirv::dr::Loader::new();
+            let mut loader = RspirvLoaderWithUnsupportedTypesConstsBypass::default();
             rspirv::binary::parse_bytes(bytes, &mut loader).unwrap();
             loader.module()
         };

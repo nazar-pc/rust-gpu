@@ -4,8 +4,8 @@ use crate::custom_insts::{self, CustomInst, CustomOp};
 use smallvec::SmallVec;
 use spirt::func_at::FuncAt;
 use spirt::{
-    Attr, AttrSet, ConstDef, ConstKind, ControlNodeKind, DataInstFormDef, DataInstKind, DeclDef,
-    EntityDefs, ExportKey, Exportee, Module, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
+    Attr, AttrSet, ConstDef, ConstKind, DataInstKind, DbgSrcLoc, DeclDef, ExportKey, Exportee,
+    Module, Type, TypeKind, Value, cfg, scalar, spv,
 };
 use std::fmt::Write as _;
 
@@ -46,11 +46,11 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
     // HACK(eddyb) deduplicate with `diagnostics`.
     let name_from_attrs = |attrs: AttrSet| {
         cx[attrs].attrs.iter().find_map(|attr| match attr {
-            Attr::SpvAnnotation(spv_inst) if spv_inst.opcode == wk.OpName => Some(
-                super::diagnostics::decode_spv_lit_str_with(&spv_inst.imms, |name| {
+            Attr::SpvAnnotation(spv_inst) if spv_inst.opcode == wk.OpName => {
+                Some(super::decode_spv_lit_str_with(&spv_inst.imms, |name| {
                     name.to_string()
-                }),
-            ),
+                }))
+            }
             _ => None,
         })
     };
@@ -88,7 +88,7 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
             match entry_point_imms[..] {
                 [spv::Imm::Short(em_kind, _), ref name_imms @ ..] => {
                     assert_eq!(em_kind, wk.ExecutionModel);
-                    super::diagnostics::decode_spv_lit_str_with(name_imms, |name| {
+                    super::decode_spv_lit_str_with(name_imms, |name| {
                         fmt += &name.replace('%', "%%");
                     });
                 }
@@ -99,70 +99,49 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
             // Collect entry-point inputs `OpLoad`ed by the entry block.
             // HACK(eddyb) this relies on Rust-GPU always eagerly loading inputs.
             let loaded_inputs = func_def_body
-                .at(func_def_body
-                    .at_body()
-                    .at_children()
-                    .into_iter()
-                    .next()
-                    .and_then(|func_at_first_node| match func_at_first_node.def().kind {
-                        ControlNodeKind::Block { insts } => Some(insts),
-                        _ => None,
-                    })
-                    .unwrap_or_default())
+                .at_body()
+                .at_children()
                 .into_iter()
                 .filter_map(|func_at_inst| {
                     let data_inst_def = func_at_inst.def();
-                    let data_inst_form_def = &cx[data_inst_def.form];
-                    if let DataInstKind::SpvInst(spv_inst) = &data_inst_form_def.kind
-                        && spv_inst.opcode == wk.OpLoad
-                        && let Value::Const(ct) = data_inst_def.inputs[0]
-                        && let ConstKind::PtrToGlobalVar(gv) = cx[ct].kind
-                        && interface_global_vars.contains(&gv)
-                    {
-                        return Some((
-                            gv,
-                            data_inst_form_def.output_type.unwrap(),
-                            Value::DataInstOutput(func_at_inst.position),
-                        ));
+                    if let DataInstKind::SpvInst(spv_inst) = &data_inst_def.kind {
+                        if spv_inst.opcode == wk.OpLoad {
+                            if let Value::Const(ct) = data_inst_def.inputs[0] {
+                                if let ConstKind::PtrToGlobalVar(gv) = cx[ct].kind {
+                                    if interface_global_vars.contains(&gv) {
+                                        let output_var = data_inst_def.outputs[0];
+                                        return Some((
+                                            gv,
+                                            func_at_inst.at(output_var).decl().ty,
+                                            Value::Var(output_var),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
                     None
                 });
             if inputs {
                 let mut first_input = true;
                 for (gv, ty, value) in loaded_inputs {
-                    let scalar_type = |ty: Type| match &cx[ty].kind {
-                        TypeKind::SpvInst { spv_inst, .. } => match spv_inst.imms[..] {
-                            [spv::Imm::Short(_, 32), spv::Imm::Short(_, signedness)]
-                                if spv_inst.opcode == wk.OpTypeInt =>
-                            {
-                                Some(if signedness != 0 { "i" } else { "u" })
+                    let vector_or_scalar_fmt = |ty: Type| {
+                        let (scalar_type, vlen) = match cx[ty].kind {
+                            TypeKind::Scalar(ty) => (ty, None),
+                            TypeKind::Vector(ty) if (2..=4).contains(&ty.elem_count.get()) => {
+                                (ty.elem, Some(ty.elem_count))
                             }
-                            [spv::Imm::Short(_, 32)] if spv_inst.opcode == wk.OpTypeFloat => {
-                                Some("f")
-                            }
-                            _ => None,
-                        },
-                        _ => None,
+                            _ => return None,
+                        };
+                        let scalar_fmt = match scalar_type {
+                            scalar::Type::S32 => "i",
+                            scalar::Type::U32 => "u",
+                            scalar::Type::F32 => "f",
+                            _ => return None,
+                        };
+                        Some((scalar_fmt, vlen))
                     };
-                    let vector_or_scalar_type = |ty: Type| {
-                        let ty_def = &cx[ty];
-                        match &ty_def.kind {
-                            TypeKind::SpvInst {
-                                spv_inst,
-                                type_and_const_inputs,
-                            } if spv_inst.opcode == wk.OpTypeVector => {
-                                match (&type_and_const_inputs[..], &spv_inst.imms[..]) {
-                                    (
-                                        &[TypeOrConst::Type(elem)],
-                                        &[spv::Imm::Short(_, vlen @ 2..=4)],
-                                    ) => Some((scalar_type(elem)?, Some(vlen))),
-                                    _ => None,
-                                }
-                            }
-                            _ => Some((scalar_type(ty)?, None)),
-                        }
-                    };
-                    if let Some((scalar_fmt, vlen)) = vector_or_scalar_type(ty) {
+                    if let Some((scalar_fmt, vlen)) = vector_or_scalar_fmt(ty) {
                         if !first_input {
                             fmt += ", ";
                         }
@@ -194,16 +173,6 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
             .expect("Abort->OpReturn can only be done on unstructured CFGs")
             .rev_post_order(func_def_body);
         for region in rpo_regions {
-            let region_def = &func_def_body.control_regions[region];
-            let control_node_def = match region_def.children.iter().last {
-                Some(last_node) => &mut func_def_body.control_nodes[last_node],
-                _ => continue,
-            };
-            let block_insts = match &mut control_node_def.kind {
-                ControlNodeKind::Block { insts } => insts,
-                _ => continue,
-            };
-
             let terminator = &mut func_def_body
                 .unstructured_cfg
                 .as_mut()
@@ -214,35 +183,35 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
                 _ => continue,
             }
 
-            // HACK(eddyb) this allows accessing the `DataInst` iterator while
-            // mutably borrowing other parts of `FuncDefBody`.
-            let func_at_block_insts = FuncAt {
-                control_nodes: &EntityDefs::new(),
-                control_regions: &EntityDefs::new(),
-                data_insts: &func_def_body.data_insts,
+            // HACK(eddyb) this allows using `FuncAt` while mutably borrowing
+            // `func_def_body.unstructured_cfg`.
+            let func = FuncAt {
+                regions: &func_def_body.regions,
+                nodes: &func_def_body.nodes,
+                vars: &func_def_body.vars,
 
-                position: *block_insts,
+                position: (),
             };
-            let block_insts_maybe_custom = func_at_block_insts.into_iter().map(|func_at_inst| {
-                let data_inst_def = func_at_inst.def();
-                (
-                    func_at_inst,
-                    match cx[data_inst_def.form].kind {
+
+            let custom_terminator_inst = func
+                .at(region)
+                .at_children()
+                .into_iter()
+                .next_back()
+                .and_then(|func_at_inst| {
+                    let data_inst_def = func_at_inst.def();
+                    match data_inst_def.kind {
                         DataInstKind::SpvExtInst { ext_set, inst }
                             if ext_set == custom_ext_inst_set =>
                         {
-                            Some(CustomOp::decode(inst).with_operands(&data_inst_def.inputs))
+                            Some((
+                                func_at_inst,
+                                CustomOp::decode(inst).with_operands(&data_inst_def.inputs),
+                            ))
                         }
                         _ => None,
-                    },
-                )
-            });
-            let custom_terminator_inst = block_insts_maybe_custom
-                .clone()
-                .rev()
-                .take_while(|(_, custom)| custom.is_some())
-                .map(|(func_at_inst, custom)| (func_at_inst, custom.unwrap()))
-                .find(|(_, custom)| !custom.op().is_debuginfo())
+                    }
+                })
                 .filter(|(_, custom)| custom.op().is_terminator());
             if let Some((
                 func_at_abort_inst,
@@ -265,79 +234,21 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
                         inputs: _,
                         backtrace,
                     }) => {
-                        let const_kind = |v: Value| match v {
-                            Value::Const(ct) => &cx[ct].kind,
-                            _ => unreachable!(),
+                        let expect_const = |v| match v {
+                            Value::Const(ct) => ct,
+                            Value::Var(_) => unreachable!(),
                         };
-                        let const_str = |v: Value| match const_kind(v) {
-                            &ConstKind::SpvStringLiteralForExtInst(s) => s,
-                            _ => unreachable!(),
-                        };
-                        let const_u32 = |v: Value| match const_kind(v) {
-                            ConstKind::SpvInst {
-                                spv_inst_and_const_inputs,
-                            } => {
-                                let (spv_inst, _const_inputs) = &**spv_inst_and_const_inputs;
-                                assert!(spv_inst.opcode == wk.OpConstant);
-                                match spv_inst.imms[..] {
-                                    [spv::Imm::Short(_, x)] => x,
-                                    _ => unreachable!(),
-                                }
-                            }
+                        let const_str = |v| match cx[expect_const(v)].kind {
+                            ConstKind::SpvStringLiteralForExtInst(s) => s,
                             _ => unreachable!(),
                         };
                         let mk_const_str = |s| {
                             cx.intern(ConstDef {
                                 attrs: Default::default(),
-                                ty: cx.intern(TypeDef {
-                                    attrs: Default::default(),
-                                    kind: TypeKind::SpvStringLiteralForExtInst,
-                                }),
+                                ty: cx.intern(TypeKind::SpvStringLiteralForExtInst),
                                 kind: ConstKind::SpvStringLiteralForExtInst(s),
                             })
                         };
-
-                        let mut current_debug_src_loc = None;
-                        let mut call_stack = SmallVec::<[_; 8]>::new();
-                        let block_insts_custom = block_insts_maybe_custom
-                            .filter_map(|(func_at_inst, custom)| Some((func_at_inst, custom?)));
-                        for (func_at_inst, custom) in block_insts_custom {
-                            // Stop at the abort, that we don't undo its debug context.
-                            if func_at_inst.position == abort_inst {
-                                break;
-                            }
-
-                            match custom {
-                                CustomInst::SetDebugSrcLoc {
-                                    file,
-                                    line_start,
-                                    line_end: _,
-                                    col_start,
-                                    col_end: _,
-                                } => {
-                                    current_debug_src_loc = Some((
-                                        &cx[const_str(file)],
-                                        const_u32(line_start),
-                                        const_u32(col_start),
-                                    ));
-                                }
-                                CustomInst::ClearDebugSrcLoc => current_debug_src_loc = None,
-                                CustomInst::PushInlinedCallFrame { callee_name } => {
-                                    if backtrace {
-                                        call_stack.push((
-                                            current_debug_src_loc.take(),
-                                            const_str(callee_name),
-                                        ));
-                                    }
-                                }
-                                CustomInst::PopInlinedCallFrame => {
-                                    if let Some((callsite_debug_src_loc, _)) = call_stack.pop() {
-                                        current_debug_src_loc = callsite_debug_src_loc;
-                                    }
-                                }
-                                CustomInst::Abort { .. } => {}
-                            }
-                        }
 
                         let mut fmt = String::new();
 
@@ -347,7 +258,10 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
                                 .map(|(&fmt_str, args)| (&cx[const_str(fmt_str)], args))
                                 .unwrap_or_default();
 
-                        let fmt_dbg_src_loc = |(file, line, col)| {
+                        let fmt_dbg_src_loc = |dbg_src_loc: DbgSrcLoc| {
+                            let file = &cx[dbg_src_loc.file_path];
+                            let (line, col) = dbg_src_loc.start_line_col;
+
                             // FIXME(eddyb) figure out what is going on with
                             // these column number conventions, below is a
                             // related comment from `spirt::print`:
@@ -375,7 +289,9 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
                             }
                         };
 
-                        if let Some(loc) = current_debug_src_loc.take() {
+                        let mut dbg_src_loc = func_at_abort_inst.def().attrs.dbg_src_loc(cx);
+
+                        if let Some(loc) = dbg_src_loc {
                             fmt += " at ";
                             fmt += &fmt_dbg_src_loc(loc);
                         }
@@ -384,38 +300,45 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
                         fmt += &message_debug_printf_fmt_str.replace('\n', "\n ");
 
                         let mut innermost = true;
-                        let mut append_call = |callsite_debug_src_loc, callee: &str| {
-                            if innermost {
-                                innermost = false;
-                                fmt += "\n      in ";
-                            } else if current_debug_src_loc.is_some() {
-                                fmt += "\n      by ";
-                            } else {
-                                // HACK(eddyb) previous call didn't have a `called at` line.
-                                fmt += "\n      called by ";
+                        let mut append_call =
+                            |callee_name: &str, call_site_loc, callee_loc: Option<_>| {
+                                if innermost {
+                                    innermost = false;
+                                    fmt += "\n      in ";
+                                } else if callee_loc.is_some() {
+                                    fmt += "\n      by ";
+                                } else {
+                                    // HACK(eddyb) previous call didn't have a `called at` line.
+                                    fmt += "\n      called by ";
+                                }
+                                fmt += callee_name;
+                                if let Some(loc) = call_site_loc {
+                                    fmt += "\n        called at ";
+                                    fmt += &fmt_dbg_src_loc(loc);
+                                }
+                            };
+                        if backtrace {
+                            while let Some((callee_name, call_site_attrs)) =
+                                dbg_src_loc.and_then(|loc| loc.inlined_callee_name_and_call_site)
+                            {
+                                let call_site_loc = call_site_attrs.dbg_src_loc(cx);
+                                append_call(
+                                    &cx[callee_name].replace('%', "%%"),
+                                    call_site_loc,
+                                    dbg_src_loc,
+                                );
+                                dbg_src_loc = call_site_loc;
                             }
-                            fmt += callee;
-                            if let Some(loc) = callsite_debug_src_loc {
-                                fmt += "\n        called at ";
-                                fmt += &fmt_dbg_src_loc(loc);
-                            }
-                            current_debug_src_loc = callsite_debug_src_loc;
-                        };
-                        while let Some((callsite_debug_src_loc, callee)) = call_stack.pop() {
-                            append_call(callsite_debug_src_loc, &cx[callee].replace('%', "%%"));
                         }
-                        append_call(None, &debug_printf_context_fmt_str);
+                        append_call(&debug_printf_context_fmt_str, None, dbg_src_loc);
 
                         fmt += "\n";
 
-                        let abort_inst_def = &mut func_def_body.data_insts[abort_inst];
-                        abort_inst_def.form = cx.intern(DataInstFormDef {
-                            kind: DataInstKind::SpvExtInst {
-                                ext_set: cx.intern("NonSemantic.DebugPrintf"),
-                                inst: 1,
-                            },
-                            output_type: cx[abort_inst_def.form].output_type,
-                        });
+                        let abort_inst_def = &mut func_def_body.nodes[abort_inst];
+                        abort_inst_def.kind = DataInstKind::SpvExtInst {
+                            ext_set: cx.intern("NonSemantic.DebugPrintf"),
+                            inst: 1,
+                        };
                         abort_inst_def.inputs = [Value::Const(mk_const_str(cx.intern(fmt)))]
                             .into_iter()
                             .chain(message_debug_printf_args.iter().copied())
@@ -427,7 +350,9 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
                     }
                     None => {}
                 }
-                block_insts.remove(abort_inst, &mut func_def_body.data_insts);
+                func_def_body.regions[region]
+                    .children
+                    .remove(abort_inst, &mut func_def_body.nodes);
             }
         }
     }

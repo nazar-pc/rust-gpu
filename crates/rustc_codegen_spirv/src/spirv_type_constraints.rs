@@ -830,7 +830,8 @@ pub fn instruction_signatures(op: Op) -> Option<&'static [InstSig<'static>]> {
         // Instructions not present in current SPIR-V specification
         // SPV_INTEL_function_pointers
         Op::ConstantFunctionPointerINTEL | Op::FunctionPointerCallINTEL => {
-            reserved!(SPV_INTEL_function_pointers);
+            // NOTE(eddyb) we actually use these despite not being in the standard yet.
+            // reserved!(SPV_INTEL_function_pointers);
         }
         // SPV_INTEL_device_side_avc_motion_estimation
         Op::VmeImageINTEL
