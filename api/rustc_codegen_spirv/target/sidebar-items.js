@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["NagaOut","SpirvTarget","TargetError"],"struct":["NagaTarget","OpenGLTarget","SpirvVersion","UniversalTarget","Version","VulkanTarget"],"trait":["SpirvTargetVariant"]};
