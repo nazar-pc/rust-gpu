@@ -199,7 +199,30 @@ def_custom_insts! {
     // invocation (format string followed by inputs) for the "message", while
     // `kind` only distinguishes broad categories like `"abort"` vs `"panic"`.
     4 => Abort { kind, ..message_debug_printf },
+
+    // [Semantic] Only used with `-C panic=unwind` (emulated unwinding), right
+    // after the `OpFunctionCall` (`call`) of an `invoke` (i.e. a call that has
+    // a landing pad, used to run cleanups, e.g. destructors, when unwinding),
+    // producing a `bool` that's `true` iff `call` has "unwound", and is used
+    // (only) by an `OpBranchConditional` between the landing pad and the normal
+    // return destination (as an opaque value, keeping the landing pad alive).
+    //
+    // The inliner (`linker::inline`) gives this its meaning: when `call` gets
+    // inlined, all of the callee's (unwinding) `Abort`s are replaced with jumps
+    // to the landing pad, and this instruction is replaced with `false` (which
+    // is also what happens to calls that don't get inlined, as only functions
+    // that may `Abort` are forcefully inlined, so all others cannot unwind).
+    //
+    // NOTE this is effectively a static form of the "emulated unwinding"
+    // described by the FIXME on `Abort`, which relies on (forced) inlining.
+    5 => CallUnwound { call },
 }
+
+/// `Abort` `kind` for `panic!`s that unwind (with `-C panic=unwind`).
+pub const ABORT_KIND_PANIC: &str = "panic";
+
+/// `Abort` `kind` for panics that cannot unwind (`core::panicking::panic_nounwind`).
+pub const ABORT_KIND_PANIC_NOUNWIND: &str = "panic_nounwind";
 
 impl CustomOp {
     /// Returns `true` iff this `CustomOp` is a custom debuginfo instruction,
@@ -211,7 +234,7 @@ impl CustomOp {
             | CustomOp::PushInlinedCallFrame
             | CustomOp::PopInlinedCallFrame => true,
 
-            CustomOp::Abort => false,
+            CustomOp::Abort | CustomOp::CallUnwound => false,
         }
     }
 
@@ -223,7 +246,8 @@ impl CustomOp {
             CustomOp::SetDebugSrcLoc
             | CustomOp::ClearDebugSrcLoc
             | CustomOp::PushInlinedCallFrame
-            | CustomOp::PopInlinedCallFrame => false,
+            | CustomOp::PopInlinedCallFrame
+            | CustomOp::CallUnwound => false,
 
             CustomOp::Abort => true,
         }

@@ -684,7 +684,7 @@ impl<'a> Visitor<'a> for DiagnosticReporter<'a> {
                                     _ => unreachable!(),
                                 }
                             }
-                            CustomInst::Abort { .. } => {}
+                            CustomInst::Abort { .. } | CustomInst::CallUnwound { .. } => {}
                         },
                     }
                 }

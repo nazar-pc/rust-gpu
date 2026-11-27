@@ -1,0 +1,14 @@
+error: Unresolved symbol "detected panic: unwrap"
+   |
+   = note: the symbol is still used after all optimizations
+   = note: used at $DIR/fail.rs:39:14
+   = note: possible panic at $DIR/fail.rs:41:46: called `Option::unwrap()` on a `None` value
+
+error: Unresolved symbol "detected panic: index"
+   |
+   = note: the symbol is still used after all optimizations
+   = note: used at $DIR/fail.rs:37:14
+   = note: possible panic at $DIR/fail.rs:37:49: index out of bounds: the len is %u but the index is %u
+
+error: aborting due to 2 previous errors
+

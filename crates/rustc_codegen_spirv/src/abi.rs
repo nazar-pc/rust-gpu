@@ -85,6 +85,7 @@ pub(crate) fn provide(providers: &mut Providers) {
     fn readjust_fn_abi<'tcx>(
         tcx: TyCtxt<'tcx>,
         fn_abi: &'tcx FnAbi<'tcx, Ty<'tcx>>,
+        instance: Option<ty::Instance<'tcx>>,
     ) -> &'tcx FnAbi<'tcx, Ty<'tcx>> {
         let readjust_arg_abi = |arg: &ArgAbi<'tcx, Ty<'tcx>>| {
             let mut arg = ArgAbi::new(arg.layout, |_, _| ArgAttributes::new());
@@ -118,14 +119,30 @@ pub(crate) fn provide(providers: &mut Providers) {
             c_variadic: fn_abi.c_variadic,
             fixed_count: fn_abi.fixed_count,
             conv: fn_abi.conv,
-            can_unwind: fn_abi.can_unwind,
+            can_unwind: fn_abi.can_unwind
+                && !instance.is_some_and(|instance| is_fmt_args_ctor(tcx, instance)),
         })
+    }
+    // HACK with `-C panic=unwind`, calls that can unwind (and for which
+    // unwinding needs to be handled, even if only to "terminate" for `nounwind`
+    // callers) end their basic block, but `fmt::Arguments` (and `fmt::rt::Argument`)
+    // constructors need to be in the same block as the `panic` entry-point call
+    // using them (for the `format_args!` decompiler), and they never panic anyway.
+    fn is_fmt_args_ctor(tcx: TyCtxt<'_>, instance: ty::Instance<'_>) -> bool {
+        let lang_items = tcx.lang_items();
+        tcx.impl_of_assoc(instance.def_id())
+            .is_some_and(|impl_def_id| {
+                let self_ty = tcx.type_of(impl_def_id).skip_binder();
+                matches!(self_ty.kind(), ty::Adt(adt_def, _)
+                if [lang_items.format_arguments(), lang_items.format_argument()]
+                    .contains(&Some(adt_def.did())))
+            })
     }
     providers.queries.fn_abi_of_fn_ptr = |tcx, key| {
         let result = (rustc_interface::DEFAULT_QUERY_PROVIDERS
             .queries
             .fn_abi_of_fn_ptr)(tcx, key);
-        Ok(readjust_fn_abi(tcx, result?))
+        Ok(readjust_fn_abi(tcx, result?, None))
     };
     providers.queries.fn_abi_of_instance_no_deduced_attrs = |tcx, key| {
         let result = (rustc_interface::DEFAULT_QUERY_PROVIDERS
@@ -136,16 +153,25 @@ pub(crate) fn provide(providers: &mut Providers) {
         // Otherwise, if `fn_abi_of_instance` would route through this query
         // directly (e.g. incremental or opt-level=0), apply SPIR-V readjustment.
         if tcx.sess.opts.optimize != OptLevel::No && tcx.sess.opts.incremental.is_none() {
-            result
+            let fn_abi = result?;
+            let instance = key.value.0;
+            if fn_abi.can_unwind && is_fmt_args_ctor(tcx, instance) {
+                // NOTE this must match `fn_abi_of_instance_raw`.
+                let mut fn_abi = fn_abi.clone();
+                fn_abi.can_unwind = false;
+                Ok(tcx.arena.alloc(fn_abi))
+            } else {
+                Ok(fn_abi)
+            }
         } else {
-            Ok(readjust_fn_abi(tcx, result?))
+            Ok(readjust_fn_abi(tcx, result?, Some(key.value.0)))
         }
     };
     providers.queries.fn_abi_of_instance_raw = |tcx, key| {
         let result = (rustc_interface::DEFAULT_QUERY_PROVIDERS
             .queries
             .fn_abi_of_instance_raw)(tcx, key);
-        Ok(readjust_fn_abi(tcx, result?))
+        Ok(readjust_fn_abi(tcx, result?, Some(key.value.0)))
     };
 
     // HACK(eddyb) work around https://github.com/rust-lang/rust/pull/132173

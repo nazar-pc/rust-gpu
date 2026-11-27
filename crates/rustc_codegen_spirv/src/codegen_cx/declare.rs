@@ -214,11 +214,36 @@ impl<'tcx> CodegenCx<'tcx> {
         {
             self.panic_entry_points.borrow_mut().insert(def_id);
         }
+        if self.tcx.lang_items().panic_nounwind() == Some(def_id) {
+            self.panic_nounwind_entry_points.borrow_mut().insert(def_id);
+        }
+
+        // NOTE these are only used with `-C panic=unwind` (by "terminate"
+        // landing pads, i.e. when unwinding out of a `nounwind` function, or out
+        // of cleanups), and they have no arguments, so the message is known.
+        let lang_items = self.tcx.lang_items();
+        for (lang_item, message) in [
+            (
+                lang_items.panic_cannot_unwind(),
+                "panic in a function that cannot unwind",
+            ),
+            (
+                lang_items.panic_in_cleanup(),
+                "panic in a destructor during cleanup",
+            ),
+        ] {
+            if lang_item == Some(def_id) {
+                self.panic_nounwind_fixed_message_fns
+                    .borrow_mut()
+                    .insert(fn_id, message);
+            }
+        }
 
         // HACK(eddyb) there is no good way to identify these definitions
         // (e.g. no `#[lang = "..."]` attribute), but this works well enough.
         if demangled_symbol_name == "core::panicking::panic_nounwind_fmt" {
             self.panic_entry_points.borrow_mut().insert(def_id);
+            self.panic_nounwind_entry_points.borrow_mut().insert(def_id);
         }
         if let Some(generics) = demangled_symbol_name
             .strip_prefix("<core::fmt::Arguments>::new::<")

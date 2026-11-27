@@ -131,7 +131,7 @@ impl Transformer for CustomDebuginfoToSpv<'_> {
                             insts_to_remove.push(inst);
                             continue;
                         }
-                        CustomInst::Abort { .. } => {
+                        CustomInst::Abort { .. } | CustomInst::CallUnwound { .. } => {
                             assert!(
                                 !custom_op.is_debuginfo(),
                                 "`CustomOp::{custom_op:?}` debuginfo not lowered"

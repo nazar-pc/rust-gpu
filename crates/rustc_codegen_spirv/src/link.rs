@@ -253,6 +253,29 @@ fn post_link_single_module(
     out_filename: &Path,
     dump_prefix: Option<&OsStr>,
 ) {
+    let will_run_spirv_opt = (sess.opts.optimize != OptLevel::No
+        || (sess.opts.debuginfo == DebugInfo::None
+            && cg_args.spirv_metadata == SpirvMetadata::None))
+        && cg_args.run_spirv_opt;
+
+    // NOTE unresolved symbols are only errors if they're still used after
+    // all optimizations (see `report_calls_to_unresolved_symbol_stubs`), which
+    // without `spirv-opt` means only the linker's own optimizations apply.
+    let mut module = module;
+    let has_unresolved_symbol_stubs =
+        crate::linker::import_export_link::has_unresolved_symbol_stubs(&module);
+    if has_unresolved_symbol_stubs
+        && !will_run_spirv_opt
+        && crate::linker::import_export_link::report_calls_to_unresolved_symbol_stubs(sess, &module)
+            .is_err()
+    {
+        return;
+    }
+    // Panic site markers are only needed to explain unresolved symbol errors.
+    if !(has_unresolved_symbol_stubs && will_run_spirv_opt) {
+        crate::linker::import_export_link::remove_panic_site_markers(&mut module);
+    }
+
     cg_args.do_disassemble(&module);
     let spv_binary = module.assemble();
 
@@ -288,7 +311,27 @@ fn post_link_single_module(
     {
         if cg_args.run_spirv_opt {
             let _timer = sess.timer("link_spirv_opt");
-            do_spirv_opt(sess, cg_args, spv_binary, out_filename, opt_options)
+            if has_unresolved_symbol_stubs {
+                match spirv_opt_and_report_calls_to_unresolved_symbol_stubs(
+                    sess,
+                    cg_args,
+                    spv_binary,
+                    out_filename,
+                    opt_options,
+                ) {
+                    Ok(spv_binary) => spv_binary,
+                    Err(_) => return,
+                }
+            } else {
+                do_spirv_opt(
+                    sess,
+                    cg_args,
+                    spv_binary,
+                    out_filename,
+                    opt_options,
+                    SpirvOptPasses::All,
+                )
+            }
         } else {
             let reason = match (sess.opts.optimize, sess.opts.debuginfo == DebugInfo::None) {
                 (OptLevel::No, true) => "debuginfo=None".to_string(),
@@ -331,12 +374,70 @@ fn post_link_single_module(
     }
 }
 
+/// `spirv-opt` with extra steps, for when unresolved symbol stubs are present
+/// (see `report_calls_to_unresolved_symbol_stubs`): checking for any calls to
+/// the stubs has to happen after optimizations, but before stripping debuginfo
+/// (e.g. the `OpName`s used to find the stubs).
+fn spirv_opt_and_report_calls_to_unresolved_symbol_stubs(
+    sess: &Session,
+    cg_args: &CodegenArgs,
+    spv_binary: Vec<u32>,
+    filename: &Path,
+    options: spirv_tools::opt::Options,
+) -> Result<Vec<u32>, rustc_span::ErrorGuaranteed> {
+    let parse = |spv_binary: &[u32]| {
+        with_rspirv_loader(|loader| rspirv::binary::parse_words(spv_binary, loader)).unwrap()
+    };
+
+    let mut spv_binary = do_spirv_opt(
+        sess,
+        cg_args,
+        spv_binary,
+        filename,
+        options.clone(),
+        SpirvOptPasses::Optimizations,
+    );
+
+    let mut module = parse(&spv_binary);
+    crate::linker::import_export_link::report_calls_to_unresolved_symbol_stubs(sess, &module)?;
+
+    // Panic site markers are only needed to explain unresolved symbol errors,
+    // and removing them can allow further optimizations.
+    if crate::linker::import_export_link::remove_panic_site_markers(&mut module) {
+        spv_binary = do_spirv_opt(
+            sess,
+            cg_args,
+            module.assemble(),
+            filename,
+            options.clone(),
+            SpirvOptPasses::Optimizations,
+        );
+    }
+
+    Ok(do_spirv_opt(
+        sess,
+        cg_args,
+        spv_binary,
+        filename,
+        options,
+        SpirvOptPasses::StripDebugInfo,
+    ))
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum SpirvOptPasses {
+    All,
+    Optimizations,
+    StripDebugInfo,
+}
+
 fn do_spirv_opt(
     sess: &Session,
     cg_args: &CodegenArgs,
     spv_binary: Vec<u32>,
     filename: &Path,
     options: spirv_tools::opt::Options,
+    passes: SpirvOptPasses,
 ) -> Vec<u32> {
     use spirv_tools::{
         error,
@@ -347,6 +448,7 @@ fn do_spirv_opt(
     let mut optimizer = opt::create(Some(target.to_spirv_tools()));
 
     match sess.opts.optimize {
+        _ if passes == SpirvOptPasses::StripDebugInfo => {}
         OptLevel::No => {}
         OptLevel::Less | OptLevel::More | OptLevel::Aggressive => {
             optimizer.register_performance_passes();
@@ -356,7 +458,10 @@ fn do_spirv_opt(
         }
     }
 
-    if sess.opts.debuginfo == DebugInfo::None && cg_args.spirv_metadata == SpirvMetadata::None {
+    if passes != SpirvOptPasses::Optimizations
+        && sess.opts.debuginfo == DebugInfo::None
+        && cg_args.spirv_metadata == SpirvMetadata::None
+    {
         optimizer
             .register_pass(opt::Passes::EliminateDeadConstant)
             .register_pass(opt::Passes::StripDebugInfo);

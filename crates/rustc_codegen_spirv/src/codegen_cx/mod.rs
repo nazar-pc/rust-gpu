@@ -84,6 +84,16 @@ pub struct CodegenCx<'tcx> {
     /// All `panic!(...)`s and builtin panics (from MIR `Assert`s) call into one
     /// of these lang items, which we always replace with an "abort".
     pub panic_entry_points: RefCell<FxHashSet<DefId>>,
+    /// Subset of `panic_entry_points` that never unwind (even with `-C panic=unwind`).
+    pub panic_nounwind_entry_points: RefCell<FxHashSet<DefId>>,
+    /// Like `panic_nounwind_entry_points`, but without any arguments (or a
+    /// `fmt::Arguments` to decode), so their (fixed) message is recorded here.
+    //
+    // NOTE this is keyed by function ID, as calls may lack an `Instance`.
+    pub panic_nounwind_fixed_message_fns: RefCell<FxHashMap<Word, &'static str>>,
+    /// "Terminate" landing pads (by block ID), with `-C panic=unwind`
+    /// (see `Builder::filter_landing_pad` and `Builder::invoke`).
+    pub terminate_landing_pads: RefCell<FxHashSet<Word>>,
 
     /// `core::fmt::Arguments::{new,from_str,from_str_nonconst}` instances.
     pub fmt_args_new_fn_ids: RefCell<FxHashMap<Word, FmtArgsCtor>>,
@@ -228,6 +238,9 @@ impl<'tcx> CodegenCx<'tcx> {
             instruction_table: InstructionTable::new(),
             libm_intrinsics: Default::default(),
             panic_entry_points: Default::default(),
+            panic_nounwind_entry_points: Default::default(),
+            panic_nounwind_fixed_message_fns: Default::default(),
+            terminate_landing_pads: Default::default(),
             fmt_args_new_fn_ids: Default::default(),
             fmt_rt_arg_new_fn_ids_to_ty_and_spec: Default::default(),
             buffer_load_intrinsics: Default::default(),
@@ -921,7 +934,13 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn eh_personality(&self) -> Self::Function {
-        todo!()
+        // NOTE only used with `-C panic=unwind`, for landing pads, which
+        // ignore it (see `Builder::invoke` for how emulated unwinding works).
+        SpirvFunctionCursor {
+            ty: 0,
+            id: 0,
+            index_in_builder: usize::MAX,
+        }
     }
 
     fn sess(&self) -> &Session {

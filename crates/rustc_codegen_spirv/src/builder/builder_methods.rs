@@ -8,7 +8,7 @@ use crate::builder_spirv::{
     SpirvBlockCursor, SpirvConst, SpirvValue, SpirvValueExt, SpirvValueKind,
 };
 use crate::codegen_cx::CodegenCx;
-use crate::custom_insts::CustomInst;
+use crate::custom_insts::{self, CustomInst};
 use crate::spirv_type::SpirvType;
 use itertools::Itertools;
 use rspirv::dr::{InsertPoint, Instruction, Operand};
@@ -1335,8 +1335,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn llbb(&self) -> Self::BasicBlock {
-        // FIXME(eddyb) `llbb` should be removed from `rustc_codegen_ssa::traits`.
-        unreachable!("dead code within `rustc_codegen_ssa`")
+        // NOTE only used by `rustc_codegen_ssa` after `invoke` (which
+        // is only emitted with `-C panic=unwind`, for emulated unwinding).
+        self.current_block
     }
 
     fn set_span(&mut self, span: Span) {
@@ -1566,13 +1567,107 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         llfn: Self::Value,
         args: &[Self::Value],
         then: Self::BasicBlock,
-        _catch: Self::BasicBlock,
+        catch: Self::BasicBlock,
         funclet: Option<&Self::Funclet>,
         instance: Option<ty::Instance<'tcx>>,
     ) -> Self::Value {
-        // Exceptions don't exist, jump directly to then block
+        // NOTE without `-C panic=unwind`, `invoke` should never be used,
+        // but even if it is, there is no unwinding, so `catch` is unreachable.
+        //
+        // Also, "terminate" landing pads (see `filter_landing_pad`) only abort
+        // (using a different panic message), and using a regular call instead
+        // keeps all instructions in the same block (which e.g. the `format_args!`
+        // decompiler needs, for the `fmt::Arguments` of `panic_nounwind_fmt`).
+        if !self.tcx.sess.panic_strategy().unwinds()
+            || self.terminate_landing_pads.borrow().contains(&catch.id)
+        {
+            let result = self.call(llty, fn_attrs, fn_abi, llfn, args, funclet, instance);
+            self.emit().branch(then.id).unwrap();
+            return result;
+        }
+
+        // Emulated unwinding (see also `CustomInst::CallUnwound`): panics are
+        // `Abort`s (forcefully inlined all the way up to entry-points), and the
+        // inliner redirects (unwinding) `Abort`s in callees to landing pads.
+
+        // A direct call to an unwinding panic entry-point (e.g. `panic_fmt`)
+        // always unwinds, so its `Abort` can be replaced with a jump to the
+        // landing pad right away (after `call` handles e.g. `format_args!`).
+        let instance_def_id = instance.map(|instance| instance.def_id());
+        let is_unwinding_panic_entry_point = instance_def_id.is_some_and(|def_id| {
+            self.panic_entry_points.borrow().contains(&def_id)
+                && !self.panic_nounwind_entry_points.borrow().contains(&def_id)
+        });
+        if is_unwinding_panic_entry_point {
+            let (func_idx, block_idx) = {
+                let builder = self.emit();
+                (
+                    builder.selected_function().unwrap(),
+                    builder.selected_block().unwrap(),
+                )
+            };
+            let result = self.call(llty, fn_attrs, fn_abi, llfn, args, funclet, instance);
+
+            // `call` ended the block with `Abort` and `OpUnreachable` (and then
+            // switched to a new block, which is unreachable).
+            let custom_ext_inst_set = self.ext_inst.borrow_mut().import_custom(self);
+            {
+                let mut builder = self.emit();
+                let insts =
+                    &mut builder.module_mut().functions[func_idx].blocks[block_idx].instructions;
+                let abort_idx = insts
+                    .iter()
+                    .rposition(|inst| {
+                        inst.class.opcode == Op::ExtInst
+                            && inst.operands[0].unwrap_id_ref() == custom_ext_inst_set
+                            && custom_insts::CustomOp::decode_from_ext_inst(inst)
+                                == custom_insts::CustomOp::Abort
+                    })
+                    .unwrap();
+                assert_eq!(insts.last().unwrap().class.opcode, Op::Unreachable);
+                insts.truncate(abort_idx);
+                insts.push(Instruction::new(
+                    Op::Branch,
+                    None,
+                    None,
+                    vec![Operand::IdRef(catch.id)],
+                ));
+            }
+            self.emit().branch(then.id).unwrap();
+            return result;
+        }
+
         let result = self.call(llty, fn_attrs, fn_abi, llfn, args, funclet, instance);
-        self.emit().branch(then.id).unwrap();
+
+        // Only an actual `OpFunctionCall` can unwind (as opposed to e.g. calls
+        // to intrinsics, or anything else special-cased by `call`).
+        let call_id = {
+            let builder = self.emit();
+            let func = &builder.module_ref().functions[builder.selected_function().unwrap()];
+            let block = &func.blocks[builder.selected_block().unwrap()];
+            block
+                .instructions
+                .last()
+                .filter(|inst| inst.class.opcode == Op::FunctionCall)
+                .and_then(|inst| inst.result_id)
+        };
+        match call_id {
+            Some(call_id) => {
+                let bool_ty = SpirvType::Bool.def(self.span(), self);
+                let unwound = self.custom_inst(
+                    bool_ty,
+                    CustomInst::CallUnwound {
+                        call: Operand::IdRef(call_id),
+                    },
+                );
+                self.emit()
+                    .branch_conditional(unwound.def(self), catch.id, then.id, [])
+                    .unwrap();
+            }
+            None => {
+                self.emit().branch(then.id).unwrap();
+            }
+        }
         result
     }
 
@@ -3090,20 +3185,54 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn set_personality_fn(&mut self, _personality: Self::Function) {
-        todo!()
+        // Ignore (see `invoke` for how emulated unwinding works).
     }
 
     // These are used by everyone except msvc
     fn cleanup_landing_pad(&mut self, _pers_fn: Self::Function) -> (Self::Value, Self::Value) {
-        todo!()
+        // NOTE there is no actual exception object being propagated,
+        // but `rustc_codegen_ssa` will still store these into a stack slot,
+        // only to load them back for `resume` (and `mem2reg` removes all that).
+        use rustc_middle::ty::layout::LayoutOf as _;
+        let tcx = self.tcx;
+        let exn0_ty = self
+            .cx
+            .layout_of(Ty::new_mut_ptr(tcx, tcx.types.u8))
+            .spirv_type(self.span(), self);
+        let exn1_ty = self
+            .cx
+            .layout_of(tcx.types.i32)
+            .spirv_type(self.span(), self);
+        (self.undef(exn0_ty), self.undef(exn1_ty))
     }
 
     fn filter_landing_pad(&mut self, _pers_fn: Self::Function) {
-        todo!()
+        // NOTE only used for "terminate" landing pads (which abort, e.g.
+        // when unwinding out of `nounwind` functions), see `invoke` for why
+        // they need to be tracked.
+        self.terminate_landing_pads
+            .borrow_mut()
+            .insert(self.current_block.id);
     }
 
     fn resume(&mut self, _exn0: Self::Value, _exn1: Self::Value) {
-        todo!()
+        // Continue unwinding, i.e. propagate the panic to the caller, which
+        // is the same thing as panicking from here (see also `invoke`).
+        //
+        // FIXME the original panic message is lost at this point.
+        let void_ty = SpirvType::Void.def(rustc_span::DUMMY_SP, self);
+        let kind_id = self.emit().string(custom_insts::ABORT_KIND_PANIC);
+        let message_id = self
+            .emit()
+            .string("<unknown message> (unwinding resumed after running cleanups)");
+        self.custom_inst(
+            void_ty,
+            CustomInst::Abort {
+                kind: Operand::IdRef(kind_id),
+                message_debug_printf: [Operand::IdRef(message_id)].into_iter().collect(),
+            },
+        );
+        self.unreachable();
     }
 
     // These are used only by msvc
@@ -3428,9 +3557,34 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             return result;
         }
 
+        // NOTE these calls may lack an `instance` (e.g. "terminate"
+        // landing pads, with `-C panic=unwind`), so they're tracked by ID.
+        let panic_nounwind_fixed_message = self
+            .panic_nounwind_fixed_message_fns
+            .borrow()
+            .get(&callee_val)
+            .copied();
+        if let Some(message) = panic_nounwind_fixed_message {
+            self.abort_with_kind_and_message_debug_printf(
+                custom_insts::ABORT_KIND_PANIC_NOUNWIND,
+                message,
+                [],
+            );
+            return self.undef(result_type);
+        }
         if is_panic_entry_point {
-            return DecodedFormatArgs::try_decode_and_remove_format_args(self, args)
-                .codegen_panic(self, result_type);
+            let is_nounwind = instance_def_id
+                .is_some_and(|def_id| self.panic_nounwind_entry_points.borrow().contains(&def_id));
+            let kind = if is_nounwind {
+                custom_insts::ABORT_KIND_PANIC_NOUNWIND
+            } else {
+                custom_insts::ABORT_KIND_PANIC
+            };
+            return DecodedFormatArgs::try_decode_and_remove_format_args(self, args).codegen_panic(
+                self,
+                kind,
+                result_type,
+            );
         }
         if buffer_load_intrinsic {
             return self.codegen_buffer_load_intrinsic(fn_abi, result_type, args);

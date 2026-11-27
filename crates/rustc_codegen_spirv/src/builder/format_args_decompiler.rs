@@ -209,6 +209,7 @@ impl<'tcx> DecodedFormatArgs<'tcx> {
         };
 
         let custom_ext_inst_set_import = builder.ext_inst.borrow_mut().import_custom(builder);
+        let unwinds = builder.tcx.sess.panic_strategy().unwinds();
 
         // HACK(eddyb) we can remove SSA instructions even when they have
         // side-effects, *as long as* they are "local" enough and cannot
@@ -219,6 +220,14 @@ impl<'tcx> DecodedFormatArgs<'tcx> {
         let func_idx = builder.selected_function().unwrap();
         let block_idx = builder.selected_block().unwrap();
         let func = &mut builder.module_mut().functions[func_idx];
+
+        // With `-C panic=unwind`, calls can't be merged with the block they
+        // return to, when there is any cleanup to do on unwinding (i.e. when
+        // any values that need dropping are alive), even if the call can't
+        // unwind, so the `format_args!` instructions may be in previous blocks.
+        if unwinds {
+            merge_straight_line_predecessors_into_block(func, block_idx);
+        }
 
         let mut non_debug_insts = func.blocks[block_idx]
             .instructions
@@ -634,17 +643,27 @@ impl<'tcx> DecodedFormatArgs<'tcx> {
 }
 
 pub trait CodegenPanic<'a, 'tcx> {
-    fn codegen_panic(&self, builder: &mut Builder<'a, 'tcx>, result_type: Word) -> SpirvValue;
+    fn codegen_panic(
+        &self,
+        builder: &mut Builder<'a, 'tcx>,
+        kind: &str,
+        result_type: Word,
+    ) -> SpirvValue;
 }
 
 impl<'a, 'tcx> CodegenPanic<'a, 'tcx> for DecodedFormatArgs<'tcx> {
-    fn codegen_panic(&self, builder: &mut Builder<'a, 'tcx>, result_type: Word) -> SpirvValue {
+    fn codegen_panic(
+        &self,
+        builder: &mut Builder<'a, 'tcx>,
+        kind: &str,
+        result_type: Word,
+    ) -> SpirvValue {
         match self {
             DecodedFormatArgs {
                 const_pieces: None, ..
             } => {
                 builder.abort_with_kind_and_message_debug_printf(
-                    "panic",
+                    kind,
                     "<unknown message>",
                     std::iter::empty(),
                 );
@@ -744,11 +763,7 @@ impl<'a, 'tcx> CodegenPanic<'a, 'tcx> for DecodedFormatArgs<'tcx> {
 
                 // HACK(eddyb) redirect any possible panic call to an abort, to avoid
                 // needing to materialize `&core::panic::Location` or `format_args!`.
-                builder.abort_with_kind_and_message_debug_printf(
-                    "panic",
-                    message,
-                    debug_printf_args,
-                );
+                builder.abort_with_kind_and_message_debug_printf(kind, message, debug_printf_args);
                 builder.undef(result_type)
             }
         }
@@ -756,9 +771,14 @@ impl<'a, 'tcx> CodegenPanic<'a, 'tcx> for DecodedFormatArgs<'tcx> {
 }
 
 impl<'a, 'tcx> CodegenPanic<'a, 'tcx> for FormatArgsResult<'tcx> {
-    fn codegen_panic(&self, builder: &mut Builder<'a, 'tcx>, result_type: Word) -> SpirvValue {
+    fn codegen_panic(
+        &self,
+        builder: &mut Builder<'a, 'tcx>,
+        kind: &str,
+        result_type: Word,
+    ) -> SpirvValue {
         match self {
-            Ok(e) => e.codegen_panic(builder, result_type),
+            Ok(e) => e.codegen_panic(builder, kind, result_type),
             Err(FormatArgsNotRecognized(step)) => {
                 if let Some(current_span) = builder.current_span
                     && !builder.tcx.sess.opts.unstable_opts.ui_testing
@@ -793,9 +813,96 @@ impl<'a, 'tcx> CodegenPanic<'a, 'tcx> for FormatArgsResult<'tcx> {
                 }
 
                 let msg = "<unknown message> (failed to find/decode `format_args!` expansion)";
-                builder.abort_with_kind_and_message_debug_printf("panic", msg, std::iter::empty());
+                builder.abort_with_kind_and_message_debug_printf(kind, msg, std::iter::empty());
                 builder.undef(result_type)
             }
         }
+    }
+}
+
+/// Move the instructions of the "straight line" predecessors of a block (i.e.
+/// its only predecessor, as long as that unconditionally branches to it, and so
+/// on), into the start of the block itself (leaving behind only the branches).
+fn merge_straight_line_predecessors_into_block(func: &mut rspirv::dr::Function, block_idx: usize) {
+    // HACK arbitrary limit, as this only needs to cover a few calls.
+    const MAX_PREDECESSORS: usize = 16;
+
+    let branch_targets = |block: &rspirv::dr::Block| -> SmallVec<[Word; 2]> {
+        let terminator = block.instructions.last().unwrap();
+        match terminator.class.opcode {
+            Op::Branch => [terminator.operands[0].unwrap_id_ref()]
+                .into_iter()
+                .collect(),
+            Op::BranchConditional => terminator.operands[1..3]
+                .iter()
+                .map(|op| op.unwrap_id_ref())
+                .collect(),
+            Op::Switch => terminator.operands[1..]
+                .iter()
+                .filter_map(|op| op.id_ref_any())
+                .collect(),
+            _ => SmallVec::new(),
+        }
+    };
+    let is_phi = |block: &rspirv::dr::Block| {
+        block
+            .instructions
+            .iter()
+            .any(|inst| inst.class.opcode == Op::Phi)
+    };
+
+    let mut chain = SmallVec::<[usize; 4]>::new();
+    let mut current = block_idx;
+    while chain.len() < MAX_PREDECESSORS {
+        if is_phi(&func.blocks[current]) {
+            break;
+        }
+        let current_label = func.blocks[current].label_id().unwrap();
+        let mut preds = func
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                block.instructions.last().is_some()
+                    && branch_targets(block).contains(&current_label)
+            })
+            .map(|(i, _)| i);
+        let (Some(pred), None) = (preds.next(), preds.next()) else {
+            break;
+        };
+        let pred_insts = &func.blocks[pred].instructions;
+        let is_plain_branch = pred_insts.last().unwrap().class.opcode == Op::Branch
+            && !pred_insts.iter().rev().nth(1).is_some_and(|inst| {
+                matches!(inst.class.opcode, Op::LoopMerge | Op::SelectionMerge)
+            });
+        if pred == current || chain.contains(&pred) || !is_plain_branch {
+            break;
+        }
+        chain.push(pred);
+        if pred == 0 {
+            break;
+        }
+        current = pred;
+    }
+
+    let mut moved = vec![];
+    for &pred in chain.iter().rev() {
+        let insts = &mut func.blocks[pred].instructions;
+        // `OpVariable`s must remain at the start of the entry block.
+        let start = if pred == 0 {
+            insts
+                .iter()
+                .rposition(|inst| inst.class.opcode == Op::Variable)
+                .map_or(0, |i| i + 1)
+        } else {
+            0
+        };
+        let branch = insts.pop().unwrap();
+        moved.extend(insts.drain(start..));
+        insts.push(branch);
+    }
+    if !moved.is_empty() {
+        let insts = &mut func.blocks[block_idx].instructions;
+        insts.splice(0..0, moved);
     }
 }

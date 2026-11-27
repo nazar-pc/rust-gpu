@@ -124,11 +124,28 @@ impl Runner {
         struct Variation {
             name: &'static str,
             extra_flags: &'static str,
+            /// Directory with the tests for this variation (relative to `tests_dir`).
+            tests_dir: &'static str,
+            /// Flags that also need to be used when building the dependencies,
+            /// which then get their own target directory.
+            deps_extra_flags: &'static str,
         }
-        const VARIATIONS: &[Variation] = &[Variation {
-            name: "default",
-            extra_flags: "",
-        }];
+        const VARIATIONS: &[Variation] = &[
+            Variation {
+                name: "default",
+                extra_flags: "",
+                tests_dir: "ui",
+                deps_extra_flags: "",
+            },
+            // Emulated unwinding requires `core` etc. to be built with it too,
+            // so its tests are kept separate (and don't run in other variations).
+            Variation {
+                name: "unwind",
+                extra_flags: " -Cpanic=unwind",
+                tests_dir: "ui-unwind",
+                deps_extra_flags: " -Cpanic=unwind",
+            },
+        ];
 
         for (env, variation) in self
             .opt
@@ -155,8 +172,19 @@ impl Runner {
                 TargetSpecVersion::target_arg(rustc_version, &target, &self.target_spec_dir)
                     .unwrap();
 
-            let libs = self.build_deps(&target, &target_spec);
-            let search_dirs = self.dep_search_dirs(&target);
+            let deps_target_dir = if variation.deps_extra_flags.is_empty() {
+                self.deps_target_dir.clone()
+            } else {
+                let mut dir = self.deps_target_dir.clone().into_os_string();
+                dir.push(format!("-{}", variation.name));
+                PathBuf::from(dir)
+            };
+            let deps = Deps {
+                target_dir: deps_target_dir,
+                rustflags: rust_flags(&self.codegen_backend_path) + variation.deps_extra_flags,
+            };
+            let libs = deps.build(&target, &target_spec);
+            let search_dirs = deps.search_dirs(&target);
             let mut flags = test_rustc_flags(&self.codegen_backend_path, &libs, &search_dirs);
             flags += variation.extra_flags;
 
@@ -165,7 +193,7 @@ impl Runner {
                 target_rustcflags: Some(flags),
                 mode,
                 target: target_spec.target.into_string().unwrap(),
-                src_base: self.tests_dir.join(mode.to_string()),
+                src_base: self.tests_dir.join(variation.tests_dir),
                 build_base: self.compiletest_build_dir.clone(),
                 bless: self.opt.bless,
                 filters: self.opt.filters.clone(),
@@ -177,9 +205,17 @@ impl Runner {
             compiletest::run_tests(&config);
         }
     }
+}
 
+/// Where (and how) the dependencies of the tests are built.
+struct Deps {
+    target_dir: PathBuf,
+    rustflags: String,
+}
+
+impl Deps {
     /// Runs the processes needed to build `spirv-std` & other deps.
-    fn build_deps(&self, target: &SpirvTarget, target_spec: &TargetSpec) -> Vec<TestDep> {
+    fn build(&self, target: &SpirvTarget, target_spec: &TargetSpec) -> Vec<TestDep> {
         // Build compiletests-deps-helper
         let mut cmd = std::process::Command::new("cargo");
         cmd.args([
@@ -192,8 +228,8 @@ impl Runner {
         ]);
         target_spec.append_to_cmd(&mut cmd);
         cmd.arg("--target-dir")
-            .arg(&self.deps_target_dir)
-            .env("RUSTFLAGS", rust_flags(&self.codegen_backend_path))
+            .arg(&self.target_dir)
+            .env("RUSTFLAGS", &self.rustflags)
             .stderr(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .status()
@@ -216,29 +252,27 @@ impl Runner {
             Vec::from(all_deps)
         } else {
             eprintln!("warning: cleaning and rebuilding deps");
-            self.clean_deps();
-            self.build_deps(target, target_spec)
+            self.clean();
+            self.build(target, target_spec)
         }
     }
 
-    fn clean_deps(&self) {
+    fn clean(&self) {
         std::process::Command::new("cargo")
             .arg("clean")
             .arg("--target-dir")
-            .arg(&self.deps_target_dir)
+            .arg(&self.target_dir)
             .status()
             .and_then(map_status_to_result)
             .unwrap();
     }
-}
 
-impl Runner {
     /// search for `out` dirs for all compiled libraries
-    fn dep_search_dirs(&self, target: &SpirvTarget) -> Vec<PathBuf> {
+    fn search_dirs(&self, target: &SpirvTarget) -> Vec<PathBuf> {
         [
-            self.deps_target_dir
+            self.target_dir
                 .join(DepKind::SpirvLib.target_dir_suffix(target)),
-            self.deps_target_dir
+            self.target_dir
                 .join(DepKind::ProcMacro.target_dir_suffix(target)),
         ]
         .iter()
@@ -260,7 +294,7 @@ impl Runner {
         let (expected_prefix, expected_suffix) = dep_kind.prefix_and_extension();
         let expected_prefix = format!("{expected_prefix}{}", ident_name);
         let build_dir = self
-            .deps_target_dir
+            .target_dir
             .join(dep_kind.target_dir_suffix(target))
             .join(name);
 

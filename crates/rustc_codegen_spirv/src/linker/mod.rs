@@ -5,7 +5,7 @@ pub(crate) mod dce;
 mod destructure_composites;
 mod duplicates;
 mod entry_interface;
-mod import_export_link;
+pub(crate) mod import_export_link;
 mod inline;
 mod ipo;
 mod mem2reg;

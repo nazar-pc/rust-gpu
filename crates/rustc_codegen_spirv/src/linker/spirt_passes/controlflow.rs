@@ -335,7 +335,7 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
                                         current_debug_src_loc = callsite_debug_src_loc;
                                     }
                                 }
-                                CustomInst::Abort { .. } => {}
+                                CustomInst::Abort { .. } | CustomInst::CallUnwound { .. } => {}
                             }
                         }
 
@@ -368,7 +368,8 @@ pub fn convert_custom_aborts_to_unstructured_returns_in_entry_points(
                         // HACK(eddyb) turn "panic" into "panicked", while the
                         // general case looks like "abort" -> "aborted".
                         match &cx[const_str(abort_kind)] {
-                            "panic" => fmt += "panicked",
+                            custom_insts::ABORT_KIND_PANIC
+                            | custom_insts::ABORT_KIND_PANIC_NOUNWIND => fmt += "panicked",
                             verb => {
                                 fmt += verb;
                                 fmt += "en";

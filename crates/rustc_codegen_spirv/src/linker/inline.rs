@@ -17,6 +17,7 @@ use rustc_errors::ErrorGuaranteed;
 use rustc_session::Session;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
+use std::iter;
 use std::mem;
 
 // FIXME(eddyb) this is a bit silly, but this keeps being repeated everywhere.
@@ -43,6 +44,37 @@ pub fn inline(sess: &Session, module: &mut Module) -> super::Result<()> {
         .map(|inst| inst.result_id.unwrap());
 
     let legal_globals = LegalGlobal::gather_from_module(module);
+
+    let strings: FxHashMap<Word, String> = module
+        .debug_string_source
+        .iter()
+        .filter(|inst| inst.class.opcode == Op::String)
+        .map(|inst| {
+            (
+                inst.result_id.unwrap(),
+                inst.operands[0].unwrap_literal_string().to_string(),
+            )
+        })
+        .collect();
+    let u32_constants: FxHashMap<Word, u32> = module
+        .types_global_values
+        .iter()
+        .filter(|inst| inst.class.opcode == Op::Constant)
+        .filter_map(|inst| match inst.operands[..] {
+            [Operand::LiteralBit32(x)] => Some((inst.result_id.unwrap(), x)),
+            _ => None,
+        })
+        .collect();
+
+    let unwinding_abort_kind_ids = module
+        .debug_string_source
+        .iter()
+        .filter(|inst| {
+            inst.class.opcode == Op::String
+                && inst.operands[0].unwrap_literal_string() == custom_insts::ABORT_KIND_PANIC
+        })
+        .map(|inst| inst.result_id.unwrap())
+        .collect();
 
     let header = module.header.as_mut().unwrap();
 
@@ -126,6 +158,12 @@ pub fn inline(sess: &Session, module: &mut Module) -> super::Result<()> {
             .collect(),
 
         inlined_dont_inlines_to_cause_and_callers: FxIndexMap::default(),
+
+        unwinding_abort_kind_ids,
+
+        strings,
+        u32_constants,
+        panic_site_markers: FxIndexMap::default(),
     };
 
     let mut functions: Vec<_> = mem::take(&mut module.functions)
@@ -164,6 +202,12 @@ pub fn inline(sess: &Session, module: &mut Module) -> super::Result<()> {
     for func_idx in call_graph.post_order() {
         let mut function = mem::replace(&mut functions[func_idx], Err(FuncIsBeingInlined)).unwrap();
         inliner.inline_fn(&mut function, &functions);
+
+        // Any remaining calls (that were not inlined) can't unwind, as only
+        // functions that may (transitively) `Abort` can unwind, and those are
+        // always inlined (see also `CustomInst::CallUnwound`).
+        inliner.fold_call_unwound_to_false(&mut function);
+
         fuse_trivial_branches(&mut function);
 
         super::duplicates::DebuginfoDeduplicator {
@@ -173,6 +217,21 @@ pub fn inline(sess: &Session, module: &mut Module) -> super::Result<()> {
 
         {
             super::simple_passes::block_ordering_pass(&mut function);
+            // NOTE emulated unwinding can make landing pads unreachable,
+            // and `block_ordering_pass` removes them, but not `OpPhi` operands.
+            remove_phi_operands_from_missing_blocks(&mut function);
+
+            // NOTE emulated unwinding (see `CustomInst::CallUnwound`)
+            // can remove `Abort`s (by turning them into landing pad jumps),
+            // and landing pads may become unreachable, so the original
+            // `functions_that_may_abort` is only an over-approximation.
+            if let Some(func_id) = function.def_id()
+                && inliner.functions_that_may_abort.contains(&func_id)
+                && !inliner.function_may_abort(&function)
+            {
+                inliner.functions_that_may_abort.remove(&func_id);
+            }
+
             // Note: mem2reg requires functions to be in RPO order (i.e. block_ordering_pass)
             super::mem2reg::mem2reg(
                 inliner.header,
@@ -192,6 +251,8 @@ pub fn inline(sess: &Session, module: &mut Module) -> super::Result<()> {
     let Inliner {
         id_to_name,
         inlined_dont_inlines_to_cause_and_callers,
+        panic_site_markers,
+        op_type_void_id,
         ..
     } = inliner;
 
@@ -234,6 +295,11 @@ pub fn inline(sess: &Session, module: &mut Module) -> super::Result<()> {
                     .join(", ")
             ))
             .emit();
+    }
+    drop(span_regen);
+
+    if !panic_site_markers.is_empty() {
+        define_panic_site_markers(module, op_type_void_id, panic_site_markers);
     }
 
     Ok(())
@@ -542,6 +608,18 @@ struct Inliner<'a, 'b> {
     functions_that_may_abort: FxHashSet<Word>,
     inlined_dont_inlines_to_cause_and_callers: FxIndexMap<Word, (&'static str, FxIndexSet<Word>)>,
     // rewrite_rules: FxHashMap<Word, Word>,
+    /// IDs of `OpString`s used as the `kind` of `Abort`s that unwind (i.e. for
+    /// `panic!`s, when emulating unwinding, see `CustomInst::CallUnwound`).
+    unwinding_abort_kind_ids: FxHashSet<Word>,
+
+    /// Pre-collected `OpString`s and 32-bit `OpConstant`s (for describing panics).
+    strings: FxHashMap<Word, String>,
+    u32_constants: FxHashMap<Word, u32>,
+
+    /// "Panic site markers": functions (by description) called in place of the
+    /// `Abort`s of `panic!`s which unwind to a landing pad (see
+    /// `import_export_link::PANIC_SITE_MARKER_NAME_PREFIX` for more details).
+    panic_site_markers: FxIndexMap<String, Word>,
 }
 
 impl Inliner<'_, '_> {
@@ -595,14 +673,12 @@ impl Inliner<'_, '_> {
             .iter()
             .enumerate()
             .filter(|(_, inst)| inst.class.opcode == Op::FunctionCall)
-            .map(|(index, inst)| {
-                (
-                    index,
-                    inst,
-                    functions[self.func_id_to_idx[&inst.operands[0].id_ref_any().unwrap()]]
-                        .as_ref()
-                        .unwrap(),
-                )
+            .filter_map(|(index, inst)| {
+                // NOTE panic site markers are created during inlining.
+                let &callee_idx = self
+                    .func_id_to_idx
+                    .get(&inst.operands[0].id_ref_any().unwrap())?;
+                Some((index, inst, functions[callee_idx].as_ref().unwrap()))
             })
             .find(|(_, inst, f)| {
                 let call_site = CallSite {
@@ -632,6 +708,10 @@ impl Inliner<'_, '_> {
             None => return false,
             Some(call) => call,
         };
+
+        // Emulated unwinding: find the landing pad (if this is an `invoke`).
+        let invoke_landing_pad_and_normal_dest =
+            self.find_invoke_landing_pad_and_normal_dest(&caller.blocks[block_idx], call_index);
 
         // Propagate "may abort" from callee to caller (i.e. as aborts get inlined).
         if self
@@ -705,6 +785,17 @@ impl Inliner<'_, '_> {
         apply_rewrite_rules(&rewrite_rules, &mut inlined_callee_blocks);
         self.apply_rewrite_for_decorations(&rewrite_rules);
 
+        // Emulated unwinding: redirect all (unwinding) `Abort`s in the callee
+        // to the landing pad (as they would otherwise propagate to the caller).
+        let mut unwinding_inlined_callee_block_indices = SmallVec::<[usize; 4]>::new();
+        if let Some((landing_pad, _)) = invoke_landing_pad_and_normal_dest {
+            for (i, block) in inlined_callee_blocks.iter_mut().enumerate() {
+                if self.try_redirect_unwinding_abort(block, landing_pad) {
+                    unwinding_inlined_callee_block_indices.push(i);
+                }
+            }
+        }
+
         if let Some(call_result_phi) = &mut maybe_call_result_phi {
             // HACK(eddyb) new IDs should be generated earlier, to avoid pushing
             // callee IDs to `call_result_phi.operands` only to rewrite them here.
@@ -761,6 +852,25 @@ impl Inliner<'_, '_> {
         let mut post_call_block_insts = caller.blocks[pre_call_block_idx]
             .instructions
             .split_off(call_index + 1);
+
+        // Emulated unwinding: if the inlined callee returns, it didn't unwind.
+        if let Some((_, normal_dest)) = invoke_landing_pad_and_normal_dest {
+            self.replace_call_unwound_with_false(&mut post_call_block_insts, normal_dest);
+        }
+
+        // HACK the label of the pre-call block is needed later, and the
+        // callee's (fused) entry block also ends up using the same label.
+        let pre_call_block_label_id = caller.blocks[pre_call_block_idx].label_id().unwrap();
+        let unwinding_pred_label_ids: SmallVec<[Word; 4]> = unwinding_inlined_callee_block_indices
+            .iter()
+            .map(|&i| {
+                if i == 0 {
+                    pre_call_block_label_id
+                } else {
+                    inlined_callee_blocks[i].label_id().unwrap()
+                }
+            })
+            .collect();
 
         // pop off OpFunctionCall
         let call = caller.blocks[pre_call_block_idx]
@@ -861,7 +971,7 @@ impl Inliner<'_, '_> {
                                         current_debug_src_loc_inst = callsite_debug_src_loc_inst;
                                     }
                                 }
-                                CustomOp::Abort => break,
+                                CustomOp::Abort | CustomOp::CallUnwound => break,
                             }
                         }
                         Op::Variable => {}
@@ -927,7 +1037,251 @@ impl Inliner<'_, '_> {
             );
         }
 
+        // Emulated unwinding: the landing pad's predecessor (the pre-call block)
+        // was replaced by all the inlined callee blocks that unwind (if any).
+        if let Some((landing_pad, _)) = invoke_landing_pad_and_normal_dest {
+            let landing_pad_block = caller
+                .blocks
+                .iter_mut()
+                .find(|b| b.label_id() == Some(landing_pad))
+                .unwrap();
+            replace_phi_source(
+                landing_pad_block,
+                pre_call_block_label_id,
+                &unwinding_pred_label_ids,
+            );
+        }
+
         true
+    }
+
+    /// Emulated unwinding (see `CustomInst::CallUnwound`): if the `OpFunctionCall`
+    /// at `block.instructions[call_index]` is an `invoke` (i.e. followed by its
+    /// `CallUnwound`, and an `OpBranchConditional` using it), return the
+    /// landing pad (unwind destination) and the normal (return) destination.
+    fn find_invoke_landing_pad_and_normal_dest(
+        &self,
+        block: &Block,
+        call_index: usize,
+    ) -> Option<(Word, Word)> {
+        let call_id = block.instructions[call_index].result_id.unwrap();
+        let call_unwound_id = block.instructions[call_index + 1..]
+            .iter()
+            .find(|inst| {
+                inst.class.opcode == Op::ExtInst
+                    && inst.operands[0].unwrap_id_ref() == self.custom_ext_inst_set_import
+                    && CustomOp::decode_from_ext_inst(inst) == CustomOp::CallUnwound
+                    && inst.operands[2].unwrap_id_ref() == call_id
+            })?
+            .result_id
+            .unwrap();
+        let terminator = block.instructions.last().unwrap();
+        assert_eq!(terminator.class.opcode, Op::BranchConditional);
+        assert_eq!(terminator.operands[0].unwrap_id_ref(), call_unwound_id);
+        Some((
+            terminator.operands[1].unwrap_id_ref(),
+            terminator.operands[2].unwrap_id_ref(),
+        ))
+    }
+
+    /// Emulated unwinding (see `CustomInst::CallUnwound`): replace the only
+    /// `CallUnwound` in `insts` with `false` (i.e. remove it, and replace the
+    /// `OpBranchConditional` using it, the terminator, with `normal_dest`).
+    ///
+    /// Returns `false` (without making any changes) if there's no `CallUnwound`.
+    fn replace_call_unwound_with_false(
+        &self,
+        insts: &mut Vec<Instruction>,
+        normal_dest: Word,
+    ) -> bool {
+        let Some(call_unwound_idx) = insts.iter().position(|inst| {
+            inst.class.opcode == Op::ExtInst
+                && inst.operands[0].unwrap_id_ref() == self.custom_ext_inst_set_import
+                && CustomOp::decode_from_ext_inst(inst) == CustomOp::CallUnwound
+        }) else {
+            return false;
+        };
+        let call_unwound = insts.remove(call_unwound_idx);
+        let terminator = insts.last_mut().unwrap();
+        assert_eq!(terminator.class.opcode, Op::BranchConditional);
+        assert_eq!(
+            terminator.operands[0].unwrap_id_ref(),
+            call_unwound.result_id.unwrap()
+        );
+        assert_eq!(terminator.operands[2].unwrap_id_ref(), normal_dest);
+        *terminator = Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(normal_dest)]);
+        true
+    }
+
+    /// Emulated unwinding (see `CustomInst::CallUnwound`): replace every
+    /// `CallUnwound` in `function` with `false` (and remove the corresponding
+    /// landing pad `OpPhi` operands), for calls that were not inlined.
+    fn fold_call_unwound_to_false(&self, function: &mut Function) {
+        for block_idx in 0..function.blocks.len() {
+            let landing_pad_and_normal_dest = match function.blocks[block_idx].instructions.last() {
+                Some(terminator) if terminator.class.opcode == Op::BranchConditional => (
+                    terminator.operands[1].unwrap_id_ref(),
+                    terminator.operands[2].unwrap_id_ref(),
+                ),
+                _ => continue,
+            };
+            let (landing_pad, normal_dest) = landing_pad_and_normal_dest;
+            if self.replace_call_unwound_with_false(
+                &mut function.blocks[block_idx].instructions,
+                normal_dest,
+            ) {
+                let label_id = function.blocks[block_idx].label_id().unwrap();
+                let landing_pad_block = function
+                    .blocks
+                    .iter_mut()
+                    .find(|b| b.label_id() == Some(landing_pad))
+                    .unwrap();
+                replace_phi_source(landing_pad_block, label_id, &[]);
+            }
+        }
+    }
+
+    /// Emulated unwinding (see `CustomInst::CallUnwound`): if `block` ends in
+    /// an unwinding `Abort`, replace it with a jump to `landing_pad`.
+    fn try_redirect_unwinding_abort(&mut self, block: &mut Block, landing_pad: Word) -> bool {
+        let insts = &mut block.instructions;
+        if insts.last().map(|inst| inst.class.opcode) != Some(Op::Unreachable) {
+            return false;
+        }
+        let terminator_idx = insts.len() - 1;
+        let custom_op = |inst: &Instruction| {
+            (inst.class.opcode == Op::ExtInst
+                && inst.operands[0].unwrap_id_ref() == self.custom_ext_inst_set_import)
+                .then(|| CustomOp::decode_from_ext_inst(inst))
+        };
+        let abort_idx = insts[..terminator_idx].iter().rposition(|inst| {
+            let is_debuginfo = matches!(inst.class.opcode, Op::Line | Op::NoLine)
+                || custom_op(inst).is_some_and(|op| op.is_debuginfo());
+            !is_debuginfo
+        });
+        let Some(abort_idx) = abort_idx else {
+            return false;
+        };
+        let abort = &insts[abort_idx];
+        if custom_op(abort) != Some(CustomOp::Abort) {
+            return false;
+        }
+        let CustomInst::Abort {
+            kind,
+            message_debug_printf,
+        } = CustomInst::decode(abort)
+        else {
+            unreachable!()
+        };
+        if !self
+            .unwinding_abort_kind_ids
+            .contains(&kind.unwrap_id_ref())
+        {
+            return false;
+        }
+
+        // Describe the panic (location and message), for the panic site marker,
+        // preferring the innermost location outside of the standard library
+        // (e.g. the indexing expression, instead of the bounds check failure),
+        // by tracking the "inlined call frames" (like `spirt_passes::controlflow`).
+        let mut current_location = None;
+        let mut call_stack = SmallVec::<[_; 8]>::new();
+        for inst in &insts[..abort_idx] {
+            match (inst.class.opcode, custom_op(inst)) {
+                (Op::Line, _) => {
+                    current_location = Some((
+                        inst.operands[0].unwrap_id_ref(),
+                        inst.operands[1].unwrap_literal_bit32(),
+                        inst.operands[2].unwrap_literal_bit32(),
+                    ));
+                }
+                (Op::NoLine, _) | (_, Some(CustomOp::ClearDebugSrcLoc)) => {
+                    current_location = None;
+                }
+                (_, Some(CustomOp::SetDebugSrcLoc)) => {
+                    let CustomInst::SetDebugSrcLoc {
+                        file,
+                        line_start,
+                        col_start,
+                        ..
+                    } = CustomInst::decode(inst)
+                    else {
+                        unreachable!()
+                    };
+                    current_location = match (
+                        self.u32_constants.get(&line_start.unwrap_id_ref()),
+                        self.u32_constants.get(&col_start.unwrap_id_ref()),
+                    ) {
+                        (Some(&line), Some(&col)) => Some((file.unwrap_id_ref(), line, col)),
+                        _ => None,
+                    };
+                }
+                (_, Some(CustomOp::PushInlinedCallFrame)) => {
+                    call_stack.push(current_location.take());
+                }
+                (_, Some(CustomOp::PopInlinedCallFrame)) => {
+                    current_location = call_stack.pop().flatten();
+                }
+                _ => {}
+            }
+        }
+        let location = iter::once(current_location)
+            .chain(call_stack.into_iter().rev())
+            .flatten()
+            .filter_map(|(file, line, col)| {
+                // FIXME see `spirt_passes::controlflow` for the column
+                // numbering convention mismatch.
+                Some((self.strings.get(&file)?.as_str(), line, col + 1))
+            })
+            .reduce(|innermost, (file, line, col)| {
+                let is_std = |file: &str| file.contains("/rustlib/src/rust/library/");
+                if is_std(innermost.0) && !is_std(file) {
+                    (file, line, col)
+                } else {
+                    innermost
+                }
+            })
+            .map(|(file, line, col)| format!("{file}:{line}:{col}"));
+        let message = message_debug_printf
+            .first()
+            .and_then(|fmt_str| self.strings.get(&fmt_str.unwrap_id_ref()))
+            .map(|fmt_str| fmt_str.replace("%%", "%"));
+        let description = match (location, message) {
+            (Some(location), Some(message)) => format!("{location}: {message}"),
+            (Some(location), None) => location,
+            (None, Some(message)) => message,
+            (None, None) => "<unknown location>".to_string(),
+        };
+        let marker = if let Some(&marker) = self.panic_site_markers.get(&description) {
+            marker
+        } else {
+            let marker = self.id();
+            self.panic_site_markers.insert(description, marker);
+            marker
+        };
+        let call_result_id = self.id();
+
+        let insts = &mut block.instructions;
+        insts[abort_idx] = Instruction::new(
+            Op::FunctionCall,
+            Some(self.op_type_void_id),
+            Some(call_result_id),
+            vec![Operand::IdRef(marker)],
+        );
+        *insts.last_mut().unwrap() =
+            Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(landing_pad)]);
+        true
+    }
+
+    /// Returns `true` iff `function` contains any `Abort`s.
+    fn function_may_abort(&self, function: &Function) -> bool {
+        function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                inst.class.opcode == Op::ExtInst
+                    && inst.operands[0].unwrap_id_ref() == self.custom_ext_inst_set_import
+                    && CustomOp::decode_from_ext_inst(inst) == CustomOp::Abort
+            })
+        })
     }
 
     fn add_clone_id_rules(&mut self, rewrite_rules: &mut FxHashMap<Word, Word>, blocks: &[Block]) {
@@ -1109,7 +1463,7 @@ impl Inliner<'_, '_> {
                             inlined_frames_depth = inlined_frames_depth.saturating_sub(1);
                             continue;
                         }
-                        CustomOp::Abort => break,
+                        CustomOp::Abort | CustomOp::CallUnwound => break,
                     }
                 }
                 Op::Variable => continue,
@@ -1221,5 +1575,118 @@ fn rewrite_phi_sources(original_label_id: Word, blocks: &mut [Block], new_block_
                 }
             }
         }
+    }
+}
+
+/// Replace every `OpPhi` operand pair in `block` that uses `original_source_id`
+/// as the source (predecessor) block, with one pair per `new_source_ids` (all
+/// using the same value), or remove it, if `new_source_ids` is empty.
+fn replace_phi_source(block: &mut Block, original_source_id: Word, new_source_ids: &[Word]) {
+    let phis = block
+        .instructions
+        .iter_mut()
+        .filter(|inst| {
+            // These are the only instructions that are allowed before `OpPhi`.
+            !matches!(inst.class.opcode, Op::Line | Op::NoLine)
+        })
+        .take_while(|inst| inst.class.opcode == Op::Phi);
+    for phi in phis {
+        let old_operands = mem::take(&mut phi.operands);
+        for value_and_source_id in old_operands.chunks(2) {
+            let [value, source_id] = value_and_source_id else {
+                unreachable!()
+            };
+            if source_id.unwrap_id_ref() == original_source_id {
+                for &new_source_id in new_source_ids {
+                    phi.operands
+                        .extend([value.clone(), Operand::IdRef(new_source_id)]);
+                }
+            } else {
+                phi.operands.extend([value.clone(), source_id.clone()]);
+            }
+        }
+    }
+}
+
+/// Remove `OpPhi` operand pairs whose source (predecessor) block is missing
+/// from `function` (e.g. because it was removed for being unreachable).
+fn remove_phi_operands_from_missing_blocks(function: &mut Function) {
+    let label_ids: FxHashSet<Word> = function
+        .blocks
+        .iter()
+        .filter_map(|b| b.label_id())
+        .collect();
+    for block in &mut function.blocks {
+        let phis = block
+            .instructions
+            .iter_mut()
+            .filter(|inst| !matches!(inst.class.opcode, Op::Line | Op::NoLine))
+            .take_while(|inst| inst.class.opcode == Op::Phi);
+        for phi in phis {
+            let old_operands = mem::take(&mut phi.operands);
+            for value_and_source_id in old_operands.chunks(2) {
+                if label_ids.contains(&value_and_source_id[1].unwrap_id_ref()) {
+                    phi.operands.extend(value_and_source_id.iter().cloned());
+                }
+            }
+        }
+    }
+}
+
+/// Define the functions for all the panic site markers (see `Inliner`'s field).
+fn define_panic_site_markers(
+    module: &mut Module,
+    op_type_void_id: Word,
+    panic_site_markers: FxIndexMap<String, Word>,
+) {
+    let header = module.header.as_mut().unwrap();
+    let existing_fn_type_id = module
+        .types_global_values
+        .iter()
+        .find(|inst| {
+            inst.class.opcode == Op::TypeFunction
+                && inst.operands[..] == [Operand::IdRef(op_type_void_id)]
+        })
+        .map(|inst| inst.result_id.unwrap());
+    let fn_type_id = existing_fn_type_id.unwrap_or_else(|| {
+        let id = next_id(header);
+        module.types_global_values.push(Instruction::new(
+            Op::TypeFunction,
+            None,
+            Some(id),
+            vec![Operand::IdRef(op_type_void_id)],
+        ));
+        id
+    });
+    for (description, marker) in panic_site_markers {
+        let label_id = next_id(module.header.as_mut().unwrap());
+        let mut function = Function::new();
+        function.def = Some(Instruction::new(
+            Op::Function,
+            Some(op_type_void_id),
+            Some(marker),
+            vec![
+                Operand::FunctionControl(FunctionControl::DONT_INLINE),
+                Operand::IdRef(fn_type_id),
+            ],
+        ));
+        function.end = Some(Instruction::new(Op::FunctionEnd, None, None, vec![]));
+        function.blocks.push(Block {
+            label: Some(Instruction::new(Op::Label, None, Some(label_id), vec![])),
+            instructions: vec![Instruction::new(Op::Return, None, None, vec![])],
+        });
+        module.functions.push(function);
+        module.debug_names.push(Instruction::new(
+            Op::Name,
+            None,
+            None,
+            vec![
+                Operand::IdRef(marker),
+                Operand::LiteralString(format!(
+                    "{}{description}",
+                    super::import_export_link::PANIC_SITE_MARKER_NAME_PREFIX
+                )),
+            ],
+        ));
     }
 }

@@ -1,0 +1,7 @@
+error: Unresolved symbol "missing_but_used"
+   |
+   = note: the symbol is still used after all optimizations
+   = note: used at $DIR/used.rs:18:27
+
+error: aborting due to 1 previous error
+
