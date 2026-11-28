@@ -404,7 +404,7 @@ fn spirv_opt_and_report_calls_to_unresolved_symbol_stubs(
     const MAX_ROUNDS: usize = 4;
     for _ in 0..MAX_ROUNDS {
         let mut module = parse(&spv_binary);
-        if !crate::linker::fold_dominated_conditions::fold_dominated_conditions(&mut module) {
+        if std::env::var_os("EXPERIMENT_NO_FOLD").is_some() || !crate::linker::fold_dominated_conditions::fold_dominated_conditions(&mut module) {
             break;
         }
         spv_binary = do_spirv_opt(

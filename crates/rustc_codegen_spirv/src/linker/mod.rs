@@ -492,7 +492,7 @@ pub fn link(
     // `import_export_link`), to remove as many redundant checks (that would lead
     // to panics) as possible, before CFG structurization (which can otherwise
     // turn conditional branches into hard to analyze `bool` "flag" variables).
-    if import_export_link::has_unresolved_symbol_stubs(&output) {
+    if import_export_link::has_unresolved_symbol_stubs(&output) && std::env::var_os("EXPERIMENT_NO_FOLD").is_none() {
         let _timer = sess.timer("link_fold_dominated_conditions");
         if fold_dominated_conditions::fold_dominated_conditions_unstructured(&mut output) {
             dce::dce(&mut output);
