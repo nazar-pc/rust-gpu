@@ -801,13 +801,7 @@ impl<'a, 'tcx> CodegenPanic<'a, 'tcx> for FormatArgsResult<'tcx> {
                         "compilation may later fail due to leftover `format_args!` internals",
                     );
 
-                    if builder.tcx.sess.opts.unstable_opts.inline_mir != Some(false) {
-                        warn.note("missing `-Zinline-mir=off` flag (should've been set by `spirv-builder`)")
-                            .help("check `.cargo` and environment variables for potential overrides")
-                            .help("(or, if not using `spirv-builder` at all, add the flag manually)");
-                    } else {
-                        warn.note(format!("[RUST-GPU BUG] bailed from {step}"));
-                    }
+                    warn.note(format!("[RUST-GPU BUG] bailed from {step}"));
 
                     warn.emit();
                 }

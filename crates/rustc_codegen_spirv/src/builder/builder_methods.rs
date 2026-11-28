@@ -3059,6 +3059,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 self.debug_type(ptr.ty)
             )),
         };
+        // NOTE pointers to runtime arrays (e.g. from slices, which can reach
+        // `write_bytes` directly once MIR inlining removes the intermediate
+        // casts) are filled element by element, like a pointer to the element.
+        let elem_ty = match self.lookup_type(elem_ty) {
+            SpirvType::RuntimeArray { element } => element,
+            _ => elem_ty,
+        };
         let elem_ty_spv = self.lookup_type(elem_ty);
         let pat = match self.builder.lookup_const_scalar(fill_byte) {
             Some(fill_byte) => self.memset_const_pattern(&elem_ty_spv, fill_byte as u8),

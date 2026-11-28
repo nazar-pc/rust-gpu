@@ -78,7 +78,13 @@ impl<'tcx> CodegenCx<'tcx> {
     ) -> SpirvFunctionCursor {
         let def_id = instance.def_id();
 
-        let control = attrs_to_spirv(self.tcx.codegen_fn_attrs(def_id));
+        let mut control = attrs_to_spirv(self.tcx.codegen_fn_attrs(def_id));
+        if def_id
+            .as_local()
+            .is_some_and(|def_id| crate::attr::is_entry_point_without_inline_attr(self.tcx, def_id))
+        {
+            control.remove(FunctionControl::DONT_INLINE);
+        }
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let span = self.tcx.def_span(def_id);
         let function_type = fn_abi.spirv_type(span, self);
