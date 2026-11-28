@@ -375,9 +375,10 @@ fn post_link_single_module(
 }
 
 /// `spirv-opt` with extra steps, for when unresolved symbol stubs are present
-/// (see `report_calls_to_unresolved_symbol_stubs`): checking for any calls to
-/// the stubs has to happen after optimizations, but before stripping debuginfo
-/// (e.g. the `OpName`s used to find the stubs).
+/// (see `report_calls_to_unresolved_symbol_stubs`): optimizations are repeated
+/// with `fold_dominated_conditions` in between (to remove redundant checks,
+/// especially those leading to panics), before checking for any calls to the
+/// stubs (which requires running before stripping debuginfo, e.g. `OpName`s).
 fn spirv_opt_and_report_calls_to_unresolved_symbol_stubs(
     sess: &Session,
     cg_args: &CodegenArgs,
@@ -397,6 +398,24 @@ fn spirv_opt_and_report_calls_to_unresolved_symbol_stubs(
         options.clone(),
         SpirvOptPasses::Optimizations,
     );
+
+    // HACK the number of rounds is arbitrary, but each round can only
+    // expose more opportunities if the previous one removed some code.
+    const MAX_ROUNDS: usize = 4;
+    for _ in 0..MAX_ROUNDS {
+        let mut module = parse(&spv_binary);
+        if !crate::linker::fold_dominated_conditions::fold_dominated_conditions(&mut module) {
+            break;
+        }
+        spv_binary = do_spirv_opt(
+            sess,
+            cg_args,
+            module.assemble(),
+            filename,
+            options.clone(),
+            SpirvOptPasses::Optimizations,
+        );
+    }
 
     let mut module = parse(&spv_binary);
     crate::linker::import_export_link::report_calls_to_unresolved_symbol_stubs(sess, &module)?;

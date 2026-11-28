@@ -5,6 +5,7 @@ pub(crate) mod dce;
 mod destructure_composites;
 mod duplicates;
 mod entry_interface;
+pub(crate) mod fold_dominated_conditions;
 pub(crate) mod import_export_link;
 mod inline;
 mod ipo;
@@ -485,6 +486,17 @@ pub fn link(
             sess.timer("link_dce-and-remove_duplicate_debuginfo-after-mem2reg-after-inlining");
         dce::dce(&mut output);
         duplicates::remove_duplicate_debuginfo(&mut output);
+    }
+
+    // NOTE this is only done when there are unresolved symbol stubs (see
+    // `import_export_link`), to remove as many redundant checks (that would lead
+    // to panics) as possible, before CFG structurization (which can otherwise
+    // turn conditional branches into hard to analyze `bool` "flag" variables).
+    if import_export_link::has_unresolved_symbol_stubs(&output) {
+        let _timer = sess.timer("link_fold_dominated_conditions");
+        if fold_dominated_conditions::fold_dominated_conditions_unstructured(&mut output) {
+            dce::dce(&mut output);
+        }
     }
 
     {

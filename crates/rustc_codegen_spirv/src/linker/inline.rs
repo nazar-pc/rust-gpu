@@ -1610,7 +1610,7 @@ fn replace_phi_source(block: &mut Block, original_source_id: Word, new_source_id
 
 /// Remove `OpPhi` operand pairs whose source (predecessor) block is missing
 /// from `function` (e.g. because it was removed for being unreachable).
-fn remove_phi_operands_from_missing_blocks(function: &mut Function) {
+pub(super) fn remove_phi_operands_from_missing_blocks(function: &mut Function) {
     let label_ids: FxHashSet<Word> = function
         .blocks
         .iter()
