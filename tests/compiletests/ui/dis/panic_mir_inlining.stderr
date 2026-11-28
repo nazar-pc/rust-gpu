@@ -1,0 +1,42 @@
+               OpCapability Shader
+               OpExtension "SPV_KHR_non_semantic_info"
+          %1 = OpExtInstImport "NonSemantic.DebugPrintf"
+               OpMemoryModel Logical Simple
+               OpEntryPoint Fragment %2 "main" %x %y
+               OpExecutionMode %2 OriginUpperLeft
+          %5 = OpString "/n[Rust panicked at $DIR/panic_mir_inlining.rs:24:9]/n x (%u) must be less than y (%u)/n      in main()/n"
+          %6 = OpString "$DIR/panic_mir_inlining.rs"
+               OpName %x "x"
+               OpName %y "y"
+               OpDecorate %x Flat
+               OpDecorate %x Location 0
+               OpDecorate %y Flat
+               OpDecorate %y Location 1
+        %u32 = OpTypeInt 32 0
+%_ptr_Input_u32 = OpTypePointer Input %u32
+       %void = OpTypeVoid
+         %10 = OpTypeFunction %void
+          %x = OpVariable %_ptr_Input_u32 Input
+          %y = OpVariable %_ptr_Input_u32 Input
+       %bool = OpTypeBool
+          %2 = OpFunction %void None %10
+         %12 = OpLabel
+               OpLine %6 29 12
+         %13 = OpLoad %u32 %x
+               OpLine %6 29 35
+         %14 = OpLoad %u32 %y
+               OpLine %6 23 7
+         %15 = OpUGreaterThanEqual %bool %13 %14
+               OpNoLine
+               OpSelectionMerge %16 None
+               OpBranchConditional %15 %17 %18
+         %17 = OpLabel
+               OpLine %6 24 8
+         %19 = OpExtInst %void %1 1 %5 %13 %14
+               OpNoLine
+               OpReturn
+         %18 = OpLabel
+               OpBranch %16
+         %16 = OpLabel
+               OpReturn
+               OpFunctionEnd

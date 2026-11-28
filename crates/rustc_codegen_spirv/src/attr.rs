@@ -7,12 +7,16 @@ use crate::symbols::Symbols;
 use rspirv::spirv::{BuiltIn, ExecutionMode, ExecutionModel, StorageClass};
 use rustc_ast::{LitKind, MetaItemInner, MetaItemLit};
 use rustc_hir as hir;
-use rustc_hir::def_id::LocalModId;
+use rustc_hir::attrs::{InlineAttr, OptimizeAttr};
+use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{LocalDefId, LocalModId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Attribute, CRATE_HIR_ID, HirId, MethodKind, Target};
 use rustc_middle::hir::nested_filter;
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
+use rustc_middle::queries::ExternProviders;
 use rustc_middle::query::Providers;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::{Ident, Span, Symbol};
 use smallvec::SmallVec;
 use std::rc::Rc;
@@ -514,8 +518,83 @@ fn check_mod_attrs(tcx: TyCtxt<'_>, module_def_id: LocalModId) {
     }
 }
 
+/// Returns `true` for methods of `core::fmt::Arguments` and `core::fmt::rt::Argument`,
+/// which must not be inlined by MIR inlining, as the `format_args!` decompiler
+/// needs to pattern-match the calls themselves.
+fn is_fmt_args_method(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    let lang_items = tcx.lang_items();
+    tcx.impl_of_assoc(def_id).is_some_and(|impl_def_id| {
+        let self_ty = tcx.type_of(impl_def_id).skip_binder();
+        matches!(self_ty.kind(), ty::Adt(adt_def, _)
+            if [lang_items.format_arguments(), lang_items.format_argument()]
+                .contains(&Some(adt_def.did())))
+    })
+}
+
+fn adjust_codegen_fn_attrs(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    mut attrs: CodegenFnAttrs,
+) -> CodegenFnAttrs {
+    if is_fmt_args_method(tcx, def_id) {
+        // NOTE `#[optimize(none)]` prevents MIR inlining, while still allowing
+        // (unlike `#[inline(never)]`) instantiating the function in each crate.
+        attrs.optimize = OptimizeAttr::DoNotOptimize;
+    }
+    attrs
+}
+
+/// Returns `true` iff `def_id` has a `#[spirv(...)]` entry-point attribute.
+fn is_entry_point(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+    let sym = Symbols::get();
+    let path = [sym.rust_gpu, sym.spirv_attr_with_version];
+    let attrs: Vec<_> = tcx.get_attrs_by_path(def_id.to_def_id(), &path).collect();
+    parse_attrs_for_checking(&sym, attrs)
+        .any(|result| matches!(result, Ok((_, SpirvAttribute::Entry(_)))))
+}
+
+/// Returns `true` iff `def_id` is an entry-point without any `#[inline(...)]`
+/// attribute, which `codegen_fn_attrs` then reports as `#[inline(never)]`.
+///
+/// This keeps MIR inlining from inlining calls to generic entry-points (e.g. from
+/// a function only meant to instantiate them), which would otherwise leave those
+/// instances unused, and so missing from the module (non-generic entry-points
+/// are already excluded from MIR inlining, by `cross_crate_inlinable`).
+///
+/// The `#[inline(never)]` is only meant for MIR inlining, so it shouldn't be
+/// turned into `DontInline` for the SPIR-V function.
+pub(crate) fn is_entry_point_without_inline_attr(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
+    is_entry_point(tcx, def_id)
+        && matches!(
+            (rustc_interface::DEFAULT_QUERY_PROVIDERS
+                .queries
+                .codegen_fn_attrs)(tcx, def_id)
+            .inline,
+            InlineAttr::None
+        )
+}
+
+pub(crate) fn provide_extern(providers: &mut ExternProviders) {
+    providers.codegen_fn_attrs = |tcx, def_id| {
+        let attrs = (rustc_interface::DEFAULT_QUERY_PROVIDERS
+            .extern_queries
+            .codegen_fn_attrs)(tcx, def_id);
+        adjust_codegen_fn_attrs(tcx, def_id, attrs)
+    };
+}
+
 pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers {
+        codegen_fn_attrs: |tcx, def_id| {
+            let attrs = (rustc_interface::DEFAULT_QUERY_PROVIDERS
+                .queries
+                .codegen_fn_attrs)(tcx, def_id);
+            let mut attrs = adjust_codegen_fn_attrs(tcx, def_id.to_def_id(), attrs);
+            if is_entry_point_without_inline_attr(tcx, def_id) {
+                attrs.inline = InlineAttr::Never;
+            }
+            attrs
+        },
         check_mod_attrs: |tcx, module_def_id| {
             // Run both the default checks, and our `#[spirv(...)]` ones.
             (rustc_interface::DEFAULT_QUERY_PROVIDERS
@@ -526,12 +605,7 @@ pub(crate) fn provide(providers: &mut Providers) {
         // HACK(LegNeato) keep `#[spirv(...)]` entry-points from getting
         // internalized and DCE'd before codegen. See issue #590.
         cross_crate_inlinable: |tcx, def_id| {
-            let sym = Symbols::get();
-            let path = [sym.rust_gpu, sym.spirv_attr_with_version];
-            let attrs: Vec<_> = tcx.get_attrs_by_path(def_id.to_def_id(), &path).collect();
-            let is_entry_point = parse_attrs_for_checking(&sym, attrs)
-                .any(|result| matches!(result, Ok((_, SpirvAttribute::Entry(_)))));
-            if is_entry_point {
+            if is_entry_point(tcx, def_id) {
                 false
             } else {
                 (rustc_interface::DEFAULT_QUERY_PROVIDERS

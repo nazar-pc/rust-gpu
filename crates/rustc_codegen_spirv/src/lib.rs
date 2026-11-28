@@ -232,6 +232,7 @@ impl CodegenBackend for SpirvCodegenBackend {
 
         crate::abi::provide(providers);
         crate::attr::provide(&mut providers.queries);
+        crate::attr::provide_extern(&mut providers.extern_queries);
     }
 
     fn target_cpu(&self, sess: &Session) -> String {
